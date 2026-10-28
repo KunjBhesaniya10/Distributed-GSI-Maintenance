@@ -1,0 +1,5 @@
+# gsi_fdw extension
+comment = 'postgres_fdw with distributed global secondary indexes'
+default_version = '1.0'
+module_pathname = '$libdir/gsi_fdw'
+relocatable = false

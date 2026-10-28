@@ -105,6 +105,12 @@ Everything else builds on these.
 3. J. C. Corbett et al. *Spanner: Google's Globally-Distributed Database.* OSDI 2012. Reference design for synchronous index maintenance with 2PC.
 4. Background: *Database System Concepts*, Ch. 21–23 (sharding, distributed query processing, distributed transactions and 2PC recovery).
 
+## Plans
+- `docs/implementation_plan.md` is the **locked build plan** (interfaces, milestones, invariants). Follow it; it overrides older details in this file where they differ, e.g. index writes run immediately per row rather than being queued, GIDs are `gsi_<fxid>_<server>_<i|b>`, and nodes are listed in `gsi.gsi_node`.
+- `docs/architecture_plan.md` explains the design rationale.
+- `docs/progress.md` is the verification log shown to the professor. After finishing a milestone, add an entry with the exact test commands, their output and the checker result. Never mark something done without that evidence.
+- Expectations are high: the team had about 2 months and has already done the core course. As of 2026-10-28 only 3-4 days remain before checkpoint 1, and only the design exists. Checkpoint 1 target: M1-M5 working and verified, M6 (manual resolver + fail points) if possible. Everything else (read path, background resolver, benchmarks, stretch) is presented as the plan for after the checkpoint.
+
 ## Notes for the assistant
 - Target PostgreSQL's C extension APIs (FDW callbacks, planner hooks, CustomScan, background workers, logical decoding). Match postgres_fdw's code style when editing the copied module.
 - Keep sync mode working before touching stretch goals.

@@ -1,0 +1,42 @@
+# 1 coordinator + 3 data nodes; each data node holds one base partition
+# and one index partition.
+x-node: &node
+  image: gsi-pg:16
+  build: { context: .., dockerfile: docker/Dockerfile }
+  environment:
+    POSTGRES_HOST_AUTH_METHOD: trust
+  healthcheck:
+    test: ["CMD", "pg_isready", "-U", "postgres"]
+    interval: 2s
+    retries: 30
+
+services:
+  shard1:
+    <<: *node
+    command: postgres -c max_prepared_transactions=100
+    ports: ["5433:5432"]
+    volumes: ["./init/datanode.sql:/docker-entrypoint-initdb.d/init.sql:ro"]
+  shard2:
+    <<: *node
+    command: postgres -c max_prepared_transactions=100
+    ports: ["5434:5432"]
+    volumes: ["./init/datanode.sql:/docker-entrypoint-initdb.d/init.sql:ro"]
+    depends_on: [shard1]
+  shard3:
+    <<: *node
+    command: postgres -c max_prepared_transactions=100
+    ports: ["5435:5432"]
+    volumes: ["./init/datanode.sql:/docker-entrypoint-initdb.d/init.sql:ro"]
+    depends_on: [shard1]
+  coordinator:
+    <<: *node
+    command: >
+      postgres -c shared_preload_libraries=gsi_fdw
+               -c max_prepared_transactions=100
+               -c synchronous_commit=on
+    ports: ["5432:5432"]
+    volumes: ["./init/coordinator.sql:/docker-entrypoint-initdb.d/init.sql:ro"]
+    depends_on:
+      shard1: { condition: service_healthy }
+      shard2: { condition: service_healthy }
+      shard3: { condition: service_healthy }
