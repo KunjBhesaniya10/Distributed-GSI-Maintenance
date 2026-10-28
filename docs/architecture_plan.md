@@ -24,16 +24,16 @@ However, when a client executes a query filtering on a non-partitioning secondar
 
 This scatter-gather pattern imposes an $O(N)$ computational and network overhead that degrades linearly with cluster expansion. As the cluster grows from 3 nodes to 30 nodes, a point lookup that should execute in sub-millisecond time monopolizes execution slots across the entire cluster, inducing CPU churn, buffer pool pollution, network socket saturation, and tail-latency amplification.
 
-### 1.2 The Global Uniqueness Challenge
+### 1.2 The Global Uniqueness Challenge 
 A second critical limitation of horizontal sharding is the impossibility of enforcing global cross-shard constraints. In PostgreSQL, unique constraints are enforced locally by shard-level B-tree indexes. Because individual data nodes operate as autonomous database instances without shared memory or cross-partition visibility, Shard 1 cannot detect when a concurrent transaction inserts a duplicate attribute into Shard 2. 
 
 Neither core PostgreSQL nor Citus supports distributed global uniqueness constraints on non-partition columns. Applications are forced to either accept duplicate entries, route all writes through external locking systems (e.g., Redis, ZooKeeper), or execute costly distributed pre-checks prone to race conditions under concurrent workloads.
-
+TODO: why are we solving this?
 ### 1.3 The Global Secondary Index (GSI) Solution Overview
 To resolve both the scatter-gather penalty and the uniqueness challenge, this project designs and implements **Distributed Global Secondary Index (GSI) Maintenance for Sharded PostgreSQL**. 
 
 A Global Secondary Index is an index partitioned on the secondary attribute key $k$ (e.g., `email`), completely independent of the base table's primary key placement. The index entries are stored as explicit tuples of the format:
-$$\text{GSI Entry} = (\text{key}, \text{id}, \text{shard})$$
+$$\text{GSI Entry} = (\text{key}, \text{id}, \text{shard})$$ TODO: Why is shard needed here?
 where:
 - $\text{key}$: The indexed secondary column value (e.g., `alice@example.com`).
 - $\text{id}$: The primary key of the corresponding base table tuple.
@@ -46,7 +46,7 @@ By partitioning the index by key hash, point lookups achieve $O(1)$ network comp
 1. **Hop 1 (Index Scan):** Query the single index node hosting $\text{hash}(\text{key}) \pmod N$ to retrieve the primary key `id` and owning `shard`.
 2. **Hop 2 (Targeted Base Fetch):** Query only the target base shard with `WHERE id = ANY(...)`, eliminating broadcast to uninvolved shards.
 
-Furthermore, because all index entries for a specific key $k$ are routed to the exact same index shard, **global uniqueness is enforced natively** via a local `UNIQUE` B-tree index on that shard. Any concurrent insertion of a duplicate key across different base shards collides at the target index node and is rejected at the storage layer.
+Furthermore, because all index entries for a specific key $k$ are routed to the exact same index shard, **global uniqueness is enforced natively** via a local `UNIQUE` B-tree index on that shard. Any concurrent insertion of a duplicate key across different base shards collides at the target index node and is rejected at the storage layer. TODO: CAnnot understand paragraph, how is uniqueness enforced, give example
 
 ### 1.4 Evolution: Single-Node Parquet GSI to Distributed Multi-Node 2PC Architecture
 During the preceding semester, the team implemented a single-node secondary index engine operating over immutable, append-only Apache Parquet files. While that work addressed columnar metadata pruning and vectorized dictionary lookups, it operated within a single process address space under append-only invariants.
@@ -62,7 +62,7 @@ This project addresses an entirely distinct, orders-of-magnitude more demanding 
 |---|---|---|
 | **Cluster Topology** | **Core Deliverable (Mandatory)** | 4 PostgreSQL 16 containers (1 coordinator + 3 data nodes) orchestrated via Docker Compose on an isolated bridge network (`gsi_cluster_net`), dual-role node storage, `max_prepared_transactions >= 100`. |
 | **Synchronous 2PC Write Path** | **Core Deliverable (Mandatory)** | `gsi_fdw` write interception (`ExecForeignInsert/Update/Delete`), disabled direct modify and batching, distributed 2PC (`PREPARE TRANSACTION`), coordinator local commit decision point, strict index-first commit ordering invariant. |
-| **Global Uniqueness** | **Core Deliverable (Mandatory)** | Unique B-trees on index shards aborting conflicting transactions during Phase 1 PREPARE. |
+| **Global Uniqueness** | **Core Deliverable (Mandatory)**| Unique B-trees on index shards aborting conflicting transactions during Phase 1 PREPARE. TODO: This is not our Goal |
 | **Crash Recovery Resolver** | **Core Deliverable (Mandatory)** | Autonomous coordinator background worker (`gsi_resolver`) scanning `pg_prepared_xacts`, inspecting coordinator CLOG via `pg_xact_status(xid)`, resolving in-doubt distributed transactions. |
 | **CustomScan Read Path** | **Core Deliverable (Mandatory)** | Planner hook (`set_rel_pathlist_hook`), `GsiLookup` `CustomPath`, two-hop targeted execution, and mandatory base tuple qual recheck. |
 | **Evaluation Framework** | **Core Deliverable (Mandatory)** | Automated cross-node consistency checker (`checker.py`), `gsi.fail_point` crash fault injection harness, and `pgbench` performance benchmarking suite. |
@@ -217,7 +217,7 @@ flowchart TB
 ## 4. Catalog Schemas & Metadata Management
 
 ### 4.1 Coordinator Metadata Catalog (`gsi.gsi_index`)
-The coordinator maintains an authoritative catalog tracking GSI definitions and their lifecycle states:
+The coordinator maintains an authoritative catalog tracking GSI definitions and their lifecycle states: TODO DIfference between index_name and index_table_name?
 
 ```sql
 CREATE SCHEMA IF NOT EXISTS gsi;
@@ -360,7 +360,7 @@ When the executor executes the `CustomScan` plan node, it implements a **two-hop
    SELECT id, email, name, created_at FROM users_shard WHERE id = ANY($1);
    ```
    *Crucially, shards that do not own matching rows receive zero queries.*
-5. **Hop 3 — Base Tuple Qual Recheck (Index as a Speculative Hint):**
+5. **Hop 3 — Base Tuple Qual Recheck (Index as a Speculative Hint):** TODO: Why are we not using locking startegies for this?
    Upon receiving the base tuple from the shard, the coordinator executor re-evaluates the original restriction qual (`email = 'alice@example.com'`) on the returned tuple before passing it to the client.
    - *Why Recheck is Critical:* The index entry is treated as a speculative hint. If a concurrent transaction updated the row's email immediately after the index lookup occurred, or if an asynchronous index contains a stale pointer, the base shard fetch returns the latest snapshot row. The qual recheck filters out the tuple, completely preventing stale or corrupt phantom rows from surfacing.
 
