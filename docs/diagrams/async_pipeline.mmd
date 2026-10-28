@@ -1,0 +1,32 @@
+flowchart LR
+    subgraph DataNode["Base Data Shard (e.g. Shard 1)"]
+        BaseWrite["Client Write Commit\n(Local WAL Append, No 2PC)"]
+        WAL["PostgreSQL WAL\n(REPLICA IDENTITY FULL)"]
+        ReplSlot["Logical Replication Slot\n(gsi_slot_shard1)"]
+        Plugin["Output Plugin: gsi_decoder\n(Filters GSI tables, decodes row images\nEmits: op, old_key, new_key, id, shard)"]
+        
+        BaseWrite --> WAL
+        WAL --> ReplSlot
+        ReplSlot --> Plugin
+    end
+
+    subgraph CoordinatorNode["Coordinator Node"]
+        WALSenderStream["libpq Replication Stream\n(Physical/Logical Protocol)"]
+        ApplierWorker["Coordinator Background Worker:\ngsi_applier_worker\n(One worker per data shard)"]
+        RoutingLogic["Hash Placement Engine\n(hash(key) % N -> target index node)"]
+        LagMonitor["Lag Tracker & Metrics\n(pg_wal_lsn_diff and commit timestamp lag)"]
+
+        Plugin -->|"Streaming WAL Changes"| WALSenderStream
+        WALSenderStream --> ApplierWorker
+        ApplierWorker --> RoutingLogic
+        ApplierWorker -.->|"Acknowledge Confirmed LSN"| ReplSlot
+        ApplierWorker --> LagMonitor
+    end
+
+    subgraph IndexNodes["Index Partition Nodes"]
+        IndexTarget["Target Index Shard (e.g. Shard 3)\ngsi_users_email_p2"]
+        IdempotentApply["Idempotent Index Mutation\n(INSERT: ON CONFLICT DO UPDATE\nDELETE: WHERE key = old_key AND id = id)"]
+
+        RoutingLogic -->|"Idempotent Remote SQL / libpq"| IdempotentApply
+        IdempotentApply --> IndexTarget
+    end

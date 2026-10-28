@@ -1,0 +1,24 @@
+sequenceDiagram
+    autonumber
+    actor Client
+    participant CoordPlanner as Coordinator: Planner Hook
+    participant CoordExec as Coordinator: CustomScan Exec
+    participant IndexNode as Shard 2: Index Node (gsi_users_email_p1)
+    participant BaseNode as Shard 1: Base Shard (users_p0)
+
+    Client->>CoordPlanner: SELECT * FROM users WHERE email = 'alice@example.com'
+    Note over CoordPlanner: set_rel_pathlist_hook triggers on 'users'<br/>Qual matches indexed column 'email'<br/>Checks catalog: gsi_index.status == 'ready'<br/>Cost comparison: GsiLookup CustomPath vs Broadcast AppendPath<br/>Selects GsiLookup CustomPath
+    CoordPlanner->>CoordExec: Plan selected: CustomScan (GsiLookup)
+
+    Note over CoordExec: ExecCustomScan evaluates hash:<br/>target_index_shard = hash('alice@example.com') % 3 -> Shard 2
+    CoordExec->>IndexNode: SELECT id, shard FROM gsi_users_email_p1 WHERE key = 'alice@example.com'
+    Note over IndexNode: B-Tree Index Scan on key
+    IndexNode-->>CoordExec: Returns: id = 42, shard = 'shard1'
+
+    Note over CoordExec: Group IDs by target shard:<br/>shard1 -> [42]
+    CoordExec->>BaseNode: SELECT * FROM users_shard WHERE id = ANY(ARRAY[42])
+    Note over BaseNode: Primary Key Index Scan on id = 42
+    BaseNode-->>CoordExec: Returns tuple: (id=42, email='alice@example.com', name='Alice')
+
+    Note over CoordExec: Qual Recheck:<br/>Verify tuple.email == 'alice@example.com'<br/>(Protects against racing concurrent updates/deletes)
+    CoordExec-->>Client: Return result row: (id=42, email='alice@example.com', name='Alice')

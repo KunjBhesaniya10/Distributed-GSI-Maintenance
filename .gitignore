@@ -1,0 +1,13 @@
+# Multi-agent teamwork internal scratch & logs
+.agents/
+
+# Python caches
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Environment and IDE
+.venv/
+env/
+.vscode/
+.idea/

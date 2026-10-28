@@ -1,0 +1,42 @@
+sequenceDiagram
+    autonumber
+    actor Client
+    participant Coord as Coordinator (gsi_fdw)
+    participant Shard2 as Shard 2: Base Node (users_p1)
+    participant Shard3 as Shard 3: Index Node (gsi_users_email_p2)
+
+    Client->>Coord: INSERT INTO users (id, email, name) VALUES (101, 'bob@example.com', 'Bob')
+    Note over Coord: 1. Partition routing: hash(id=101) % 3 -> Shard 2<br/>2. Index routing: hash('bob@example.com') % 3 -> Shard 3<br/>3. Transaction assigned coord_xid = 5001
+
+    Note over Coord,Shard2: Remote Transaction on Shard 2
+    Coord->>Shard2: INSERT INTO users_p1 (id, email, name) VALUES (101, 'bob@example.com', 'Bob')
+    Shard2-->>Coord: Insert OK (pending local tx)
+
+    Note over Coord,Shard3: Remote Transaction on Shard 3
+    Coord->>Shard3: INSERT INTO gsi_users_email_p2 (key, id, shard) VALUES ('bob@example.com', 101, 'shard2')
+    Note over Shard3: Unique B-Tree Index Check<br/>(Aborts immediately on duplicate key)
+    Shard3-->>Coord: Insert OK (pending local tx)
+
+    Client->>Coord: COMMIT
+
+    rect rgb(235, 245, 255)
+        Note over Coord,Shard3: Phase 1: 2PC PREPARE (Pre-Commit Callback: XACT_EVENT_PRE_COMMIT)
+        Coord->>Shard2: PREPARE TRANSACTION 'gsi_5001_shard2'
+        Shard2-->>Coord: PREPARED OK (WAL flushed, locks held)
+        Coord->>Shard3: PREPARE TRANSACTION 'gsi_5001_shard3'
+        Shard3-->>Coord: PREPARED OK (WAL flushed, locks held)
+    end
+
+    rect rgb(255, 250, 230)
+        Note over Coord: Phase 2: Coordinator Local Decision Point<br/>Coordinator commits local xid 5001 to local WAL/CLOG.<br/>Global decision: COMMITTED (Single source of truth)
+    end
+
+    rect rgb(235, 255, 235)
+        Note over Coord,Shard3: Phase 3: Ordered COMMIT PREPARED (Post-Commit Callback: XACT_EVENT_COMMIT)<br/>CRITICAL INVARIANT: Commit Index Nodes BEFORE Base Shards
+        Coord->>Shard3: STEP 1: COMMIT PREPARED 'gsi_5001_shard3' (INDEX FIRST)
+        Shard3-->>Coord: COMMIT OK (Index entry visible to GSI readers)
+        Coord->>Shard2: STEP 2: COMMIT PREPARED 'gsi_5001_shard2' (BASE SECOND)
+        Shard2-->>Coord: COMMIT OK (Base row visible)
+    end
+
+    Coord-->>Client: COMMIT SUCCESS (200 OK)

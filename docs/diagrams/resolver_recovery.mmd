@@ -1,0 +1,41 @@
+sequenceDiagram
+    autonumber
+    participant Resolver as BG Worker: gsi_resolver (Coordinator)
+    participant CoordCLOG as Coordinator: pg_xact_status
+    participant Shard3 as Shard 3: Index Node
+    participant Shard2 as Shard 2: Base Shard
+
+    Note over Resolver: Periodic Wakeup (e.g. 5s interval)<br/>Scans cluster for orphaned prepared transactions
+
+    par Scan Shard 3
+        Resolver->>Shard3: SELECT gid FROM pg_prepared_xacts WHERE gid LIKE 'gsi_%'
+        Shard3-->>Resolver: Empty (already committed before crash)
+    and Scan Shard 2
+        Resolver->>Shard2: SELECT gid FROM pg_prepared_xacts WHERE gid LIKE 'gsi_%'
+        Shard2-->>Resolver: Found: 'gsi_5001_shard2' (Orphaned due to crash)
+    end
+
+    Note over Resolver: Parse GID string 'gsi_5001_shard2'<br/>Extract coord_xid = 5001
+
+    Resolver->>CoordCLOG: SELECT pg_xact_status('5001'::xid)
+    CoordCLOG-->>Resolver: Status: 'committed'
+
+    alt Case A: Coordinator Status == 'committed'
+        Note over Resolver,Shard2: Roll-Forward Recovery<br/>(Preserve invariant: Index before Base)
+        opt If Index Node was also lingering
+            Resolver->>Shard3: COMMIT PREPARED 'gsi_5001_shard3'
+            Shard3-->>Resolver: COMMIT OK
+        end
+        Resolver->>Shard2: COMMIT PREPARED 'gsi_5001_shard2'
+        Shard2-->>Resolver: COMMIT OK (Base row restored to consistency)
+    else Case B: Coordinator Status == 'aborted' or not found
+        Note over Resolver,Shard2: Roll-Back Recovery (Clean up dangling locks)
+        opt If Index Node was lingering
+            Resolver->>Shard3: ROLLBACK PREPARED 'gsi_5001_shard3'
+            Shard3-->>Resolver: ROLLBACK OK
+        end
+        Resolver->>Shard2: ROLLBACK PREPARED 'gsi_5001_shard2'
+        Shard2-->>Resolver: ROLLBACK OK
+    end
+
+    Note over Resolver: Cluster state fully consistent and logs resolution event

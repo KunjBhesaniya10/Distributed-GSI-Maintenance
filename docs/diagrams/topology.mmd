@@ -1,0 +1,56 @@
+flowchart TB
+    subgraph DockerHost["Docker Host: bridge network (gsi_cluster_net)"]
+        subgraph Coord["Coordinator Container (gsi-coordinator)\nHost Port: 5432:5432 | DNS: coordinator"]
+            CoordPG["PostgreSQL 16 Instance\n(shared_preload_libraries = 'gsi_fdw')\n(max_prepared_transactions = 100)"]
+            CoordCatalog["Catalog Table: gsi_index\n(name, base_table, column, mode, status)"]
+            CoordTable["Partitioned Table: users\nPARTITION BY HASH (id)"]
+            CoordHook["Planner Hook: set_rel_pathlist_hook\n(GsiLookup CustomPath Generator)"]
+            CoordScan["Executor: CustomScan\n(GSI Query + Targeted Fetch + Recheck)"]
+            Coord2PC["FDW 2PC Engine\n(Pre-commit PREPARE, Local Commit, Ordered COMMIT PREPARED)"]
+            CoordResolver["Background Worker: gsi_resolver\n(Periodic pg_prepared_xacts recovery)"]
+            CoordApplier["Background Worker: gsi_applier_worker\n(Async WAL Stream Consumer - Stretch)"]
+        end
+
+        subgraph Shard1["Shard 1 Container (gsi-shard-1)\nHost Port: 5433:5432 | DNS: shard1"]
+            S1PG["PostgreSQL 16 Instance\n(max_prepared_transactions = 100)\n(wal_level = logical)"]
+            S1Base["Base Shard Partition: users_p0\nForeign Table for id % 3 == 0"]
+            S1Index["Index Partition: gsi_users_email_p0\nB-Tree UNIQUE for hash(email) % 3 == 0\nColumns: key, id, shard"]
+            S1Decoder["Logical Decoding: gsi_decoder\n(WAL change stream plugin - Stretch)"]
+        end
+
+        subgraph Shard2["Shard 2 Container (gsi-shard-2)\nHost Port: 5434:5432 | DNS: shard2"]
+            S2PG["PostgreSQL 16 Instance\n(max_prepared_transactions = 100)\n(wal_level = logical)"]
+            S2Base["Base Shard Partition: users_p1\nForeign Table for id % 3 == 1"]
+            S2Index["Index Partition: gsi_users_email_p1\nB-Tree UNIQUE for hash(email) % 3 == 1\nColumns: key, id, shard"]
+            S2Decoder["Logical Decoding: gsi_decoder\n(WAL change stream plugin - Stretch)"]
+        end
+
+        subgraph Shard3["Shard 3 Container (gsi-shard-3)\nHost Port: 5435:5432 | DNS: shard3"]
+            S3PG["PostgreSQL 16 Instance\n(max_prepared_transactions = 100)\n(wal_level = logical)"]
+            S3Base["Base Shard Partition: users_p2\nForeign Table for id % 3 == 2"]
+            S3Index["Index Partition: gsi_users_email_p2\nB-Tree UNIQUE for hash(email) % 3 == 2\nColumns: key, id, shard"]
+            S3Decoder["Logical Decoding: gsi_decoder\n(WAL change stream plugin - Stretch)"]
+        end
+    end
+
+    Client["Client / Application / pgbench"] -->|"Port 5432: SQL Queries"| CoordPG
+
+    CoordTable -.->|"gsi_fdw foreign table"| S1Base
+    CoordTable -.->|"gsi_fdw foreign table"| S2Base
+    CoordTable -.->|"gsi_fdw foreign table"| S3Base
+
+    CoordScan -->|"Point Index Lookup: hash(key)%3"| S1Index
+    CoordScan -->|"Point Index Lookup: hash(key)%3"| S2Index
+    CoordScan -->|"Point Index Lookup: hash(key)%3"| S3Index
+
+    Coord2PC ==>|"2PC PREPARE & COMMIT PREPARED"| S1PG
+    Coord2PC ==>|"2PC PREPARE & COMMIT PREPARED"| S2PG
+    Coord2PC ==>|"2PC PREPARE & COMMIT PREPARED"| S3PG
+
+    CoordResolver -.->|"Polls pg_prepared_xacts & recovers"| S1PG
+    CoordResolver -.->|"Polls pg_prepared_xacts & recovers"| S2PG
+    CoordResolver -.->|"Polls pg_prepared_xacts & recovers"| S3PG
+
+    S1Decoder -.->|"Replication stream"| CoordApplier
+    S2Decoder -.->|"Replication stream"| CoordApplier
+    S3Decoder -.->|"Replication stream"| CoordApplier

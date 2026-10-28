@@ -1,0 +1,39 @@
+stateDiagram-v2
+    [*] --> Absent: Base table partitioned by primary key
+
+    Absent --> WriteOnly: Admin calls gsi_create('users', 'email', 'sync')
+    note right of WriteOnly
+        Write-Only Phase (F1 Schema Change):
+        - Catalog status = 'write_only'
+        - New INSERT / UPDATE / DELETE queue 2PC index writes
+        - Query Planner IGNORES index (broadcast reads continue)
+        - Prevents missing keys for writes occurring during backfill
+    end note
+
+    WriteOnly --> Backfill: Coordinator spawns Background Backfill Worker
+    note right of Backfill
+        Backfill Phase:
+        - Scans all base shards sequentially or in parallel batches
+        - Writes historical tuples to index nodes
+        - Uses ON CONFLICT (key, id) DO NOTHING
+        - Concurrent writes safely override or precede backfill entries
+    end note
+
+    Backfill --> Validation: Base shard historical scan complete
+    note right of Validation
+        Validation & Catch-Up Phase:
+        - Detects deletes that raced with backfill
+        - Cleans orphaned index tuples lacking base rows
+        - Verifies index key coverage and constraint integrity
+    end note
+
+    Validation --> Ready: Validation passed; catalog updated to 'ready'
+    note right of Ready
+        Ready Phase (Fully Operational):
+        - Catalog status = 'ready'
+        - Planner hook generates GsiLookup CustomPath
+        - Point lookups routed to single index node + single base shard
+        - Synchronous writes maintain index with 2PC
+    end note
+
+    Ready --> [*]
