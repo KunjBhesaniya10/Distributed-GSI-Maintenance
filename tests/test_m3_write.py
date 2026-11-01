@@ -67,6 +67,45 @@ def test_no_direct_modify(gsi):
     assert "Foreign Scan on public.users_p0" in plan
 
 
+def explain(conn, sql):
+    return "\n".join(r[0] for r in q(conn, "EXPLAIN VERBOSE " + sql))
+
+
+def test_non_key_update_pushed_down(gsi):
+    """An UPDATE that can't change an index entry keeps postgres_fdw's pushdown."""
+    plan = explain(gsi, "UPDATE users SET name = 'z' WHERE name = 'a'")
+    assert "WHERE ctid = $1" not in plan
+    assert "Foreign Scan" not in plan
+    assert "UPDATE public.users_shard SET name" in plan
+
+
+def test_delete_not_pushed_down(gsi):
+    plan = explain(gsi, "DELETE FROM users WHERE name = 'a'")
+    assert "WHERE ctid = $1" in plan
+
+
+def test_non_key_update_keeps_index(gsi, shards):
+    q(gsi, "INSERT INTO users SELECT g, 'u' || g || '@x', 'n' || (g % 2) FROM generate_series(1, 30) g")
+    before = entries(shards)
+    q(gsi, "UPDATE users SET name = 'z' WHERE name = 'n0'")
+    assert q(gsi, "SELECT count(*) FROM users WHERE name = 'z'")[0][0] == 15
+    assert entries(shards) == before
+    assert_consistent(gsi, shards)
+
+
+def test_mixed_xact_pushdown_and_key_update(gsi, shards):
+    """A pushed-down UPDATE and a key UPDATE in one transaction commit together."""
+    q(gsi, "INSERT INTO users SELECT g, 'u' || g || '@x', 'n' FROM generate_series(1, 30) g")
+    gsi.autocommit = False
+    q(gsi, "UPDATE users SET name = 'z' WHERE id <= 20")
+    q(gsi, "UPDATE users SET email = 'moved@x' WHERE id = 25")
+    gsi.commit()
+    gsi.autocommit = True
+    assert q(gsi, "SELECT count(*) FROM users WHERE name = 'z'")[0][0] == 20
+    assert ("moved@x", 25) in entries(shards)
+    assert_consistent(gsi, shards)
+
+
 def test_random_workload(gsi, shards):
     rnd = random.Random(631)
     for _ in range(300):

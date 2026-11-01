@@ -142,13 +142,14 @@ CREATE TABLE gsi.gsi_index (
     is_unique   boolean NOT NULL DEFAULT false,
     mode        text NOT NULL DEFAULT 'sync'  CHECK (mode IN ('sync','async')),
     status      text NOT NULL DEFAULT 'ready' CHECK (status IN ('write-only','ready')),
-    UNIQUE (base_table, column_name)
+    UNIQUE (base_table, column_name)      -- one GSI per column, several per table
 );
 
 CREATE FUNCTION gsi_create(base regclass, col name, is_unique boolean DEFAULT false,
                            mode text DEFAULT 'sync', online boolean DEFAULT false)
     RETURNS name AS 'MODULE_PATHNAME' LANGUAGE C;
-CREATE FUNCTION gsi_drop(index_name name) RETURNS void AS 'MODULE_PATHNAME' LANGUAGE C;
+CREATE FUNCTION gsi_drop(base regclass, col name DEFAULT NULL)   -- NULL: every GSI of base
+    RETURNS void AS 'MODULE_PATHNAME' LANGUAGE C;
 CREATE FUNCTION gsi_resolve() RETURNS int AS 'MODULE_PATHNAME' LANGUAGE C;   -- returns # resolved
 CREATE FUNCTION gsi_node_for(val anyelement) RETURNS int AS 'MODULE_PATHNAME' LANGUAGE C;
 ```
@@ -156,7 +157,7 @@ CREATE FUNCTION gsi_node_for(val anyelement) RETURNS int AS 'MODULE_PATHNAME' LA
 `gsi_node_for` exposes the placement hash to SQL so tests and the checker use exactly the same function (I5).
 
 **v1 restrictions** (checked in `gsi_create`, otherwise `ERROR`):
-- one indexed column;
+- each GSI covers one column (a table may have several GSIs, one per column);
 - base table partitioned by HASH;
 - every partition is a `gsi_fdw` foreign table whose server is in `gsi_node`;
 - the indexed column type has a default hash opclass;
@@ -177,8 +178,9 @@ typedef struct GsiIndexInfo
     bool        is_ready;          /* status == 'ready' */
 } GsiIndexInfo;
 
-/* NULL if relid (parent or partition) has no GSI. Allocated in CurrentMemoryContext. */
-GsiIndexInfo *gsi_get_index_for_rel(Oid relid);
+/* Every sync GSI of relid (parent or partition), ordered by name; NIL if none.
+ * Allocated in CurrentMemoryContext.  (Implemented as gsi_indexes_for_rel.) */
+List *gsi_get_indexes_for_rel(Oid relid);
 
 int         gsi_num_nodes(void);
 Oid         gsi_node_server(int node_id);          /* ForeignServer oid */
@@ -213,7 +215,7 @@ gsi_node_for_datum(Datum value, Oid typid, Oid collid, int nnodes)
 ## 4. Synchronous write path (`postgres_fdw.c`, `gsi_modify.c`)
 
 ### 4.1 Disable pushdown and batching
-- `postgresPlanDirectModify(root, plan, resultRelation, subplan_index)`: at the top, look up the RTE's relid. If `gsi_get_index_for_rel(relid) != NULL`, `return false`.
+- `postgresPlanDirectModify(root, plan, resultRelation, subplan_index)`: return false unless `gsi_direct_modify_ok(root, resultRelation, operation)`. That allows pushdown only when the write can't change an index entry: the table has no GSI, or it's an UPDATE whose `SET` list (`get_translated_update_targetlist`) contains no indexed column and not `id`. DELETE and key UPDATEs always run per row. A pushed-down UPDATE needs no 2PC (no index write); if the same transaction also writes a GSI, §5.3 prepares its shards anyway.
 - `postgresGetForeignModifyBatchSize(resultRelInfo)`: if the relation has a GSI, `return 1`. This covers INSERT into the parent and `COPY`, both of which go through tuple routing and `BeginForeignInsert`.
 
 ### 4.2 Fetch the old key (`postgresAddForeignUpdateTargets`)
@@ -223,17 +225,18 @@ static void postgresAddForeignUpdateTargets(PlannerInfo *root, Index rtindex,
                                             RangeTblEntry *target_rte,
                                             Relation target_relation);
 ```
-After the existing `ctid` row-identity var, if the relation has a GSI:
+After the existing `ctid` row-identity var, for every GSI of the relation:
 ```c
 Var *var = makeVar(rtindex, gsi->attnum_in_this_partition, atttype, atttypmod, attcollation, 0);
-add_row_identity_var(root, var, rtindex, "gsi_old_key");
+add_row_identity_var(root, var, rtindex, "gsi_old_key_<index_name>");
 ```
+plus one `gsi_old_id` var for the id.
 - Map the attnum to the partition's numbering by **column name** (`get_attnum(RelationGetRelid(target_relation), column_name)`). Partition attnums can differ from the parent's.
 - The row-identity var makes the remote fetch include the column: `SELECT ..., email, ctid FROM users_shard ... FOR UPDATE`.
 
 In `create_foreign_modify(...)` (called by both `BeginForeignModify` and `BeginForeignInsert`), for UPDATE/DELETE:
 ```c
-fmstate->gsiOldKeyAttno = ExecFindJunkAttributeInTlist(subplan->targetlist, "gsi_old_key");
+gs->old_key_junk = ExecFindJunkAttributeInTlist(subplan->targetlist, "gsi_old_key_<index_name>");   /* per GSI */
 ```
 This is the same pattern postgres_fdw already uses for `ctidAttno`.
 
@@ -424,7 +427,7 @@ Rename postgres_fdw's own GUC (`postgres_fdw.application_name`) to `gsi_fdw.appl
 ## 7. Admin functions (`gsi_admin.c`)
 
 `gsi_create(base, col, is_unique, mode, online)`:
-1. Validate the v1 restrictions (§3.1).
+1. Validate the v1 restrictions (§3.1); refuse a second GSI on the same column.
 2. Name it `<table>_<col>`; the remote table is `gsi_<table>_<col>`.
 3. On **every** node, over a `GetConnection` connection so it's covered by 2PC:
    ```sql
@@ -437,7 +440,7 @@ Rename postgres_fdw's own GUC (`postgres_fdw.application_name`) to `gsi_fdw.appl
    - `online = false`: status `ready`. **Precondition:** the base table is empty (check `SELECT 1 FROM base LIMIT 1`, else `ERROR "table not empty; use online => true"`).
    - `online = true`: status `write-only`, then run the online build (§10.2, stretch).
 
-`gsi_drop(name)`: delete the catalog row, then `DROP TABLE` on every node, in one distributed transaction.
+`gsi_drop(base, col)`: for that GSI (or every GSI of `base` when `col` is NULL), delete the catalog row, then `DROP TABLE` on every node, in one distributed transaction.
 
 ---
 
@@ -449,7 +452,7 @@ In `_PG_init`: save `prev_set_rel_pathlist_hook`, then install `gsi_set_rel_path
 ### 8.2 When to add the path
 All of these must hold:
 - `rte->rtekind == RTE_RELATION && rte->relkind == RELKIND_PARTITIONED_TABLE`;
-- `gsi_get_index_for_rel(rte->relid)` exists, `is_ready`, and isn't async;
+- some GSI in `gsi_get_indexes_for_rel(rte->relid)` is `ready`, not async, and has a matching clause (below). If several match, prefer a unique one;
 - `root->parse->resultRelation != rti`: not the target of UPDATE/DELETE, since v1 doesn't support that;
 - `root->parse->rowMarks == NIL`: no `FOR UPDATE` / `FOR SHARE`. v1 falls back to the normal plan, which locks on the shards;
 - `rel->baserestrictinfo` has a clause `OpExpr(Var(attnum) = Const|Param)` (either side), where:
@@ -459,7 +462,7 @@ All of these must hold:
 
 ### 8.3 Path and plan
 - `CustomPath`, with `path.pathtype = T_CustomScan`, `parent = rel`, `pathtarget = rel->reltarget`.
-- `custom_private = list_make2(gsi index name as String, the matched clause)`.
+- `custom_private = list_make2(the matched clause, gsi index name as String)`; the plan keeps the clause in `custom_exprs` and the name in `custom_private`, and the executor looks the GSI up by name.
 - **Cost:** `startup = 0`, `total = 0.1 * min(total_cost of paths already in rel->pathlist)`. This always wins when it applies, and it's simple and deterministic. It's fine for v1 and should be documented in the report.
 - `rows = rel->rows`.
 - `PlanCustomPath`: build a `CustomScan` with `scan.scanrelid = rel->relid`, `scan.plan.targetlist = tlist`, and `scan.plan.qual = extract_actual_clauses(clauses, false)`. **All** quals are kept, and `ExecScan` evaluates them on every fetched row, which is the recheck (I4). Put the key expression in `custom_exprs`.
@@ -529,7 +532,8 @@ Abort-path test: `docker pause shard2` during a transaction's PREPARE; expect an
 | File | Covers |
 |---|---|
 | `test_m1_cluster.py` | the four nodes are reachable; `gsi_fdw` is loaded; broadcast select works |
-| `test_m3_write.py` | insert / update (key changed and unchanged) / delete, each followed by the checker; `EXPLAIN UPDATE` shows no direct modify |
+| `test_m3_write.py` | insert / update (key changed and unchanged) / delete, each followed by the checker; `EXPLAIN` shows no direct modify for key UPDATE and DELETE, and pushdown for an UPDATE of a non-indexed column |
+| `test_multi_gsi.py` | two GSIs on one table (unique email, non-unique nullable name): every write maintains both, a unique violation rolls back both, the planner picks the matching GSI (unique preferred), dropping one keeps the other |
 | `test_m4_2pc.py` | `pg_prepared_xacts` is empty after commit; client `ROLLBACK` leaves nothing; an error in mid-transaction leaves nothing |
 | `test_m5_unique.py` | a duplicate key with a different id is rejected; concurrent duplicates from two sessions: exactly one wins; non-unique GSI accepts duplicates |
 | `test_m6_resolver.py` | the three fail points plus the paused shard |
@@ -593,7 +597,7 @@ Each milestone is done when its tests pass and the checker is clean. Do them in 
 
 ## 12. Known pitfalls (read before coding)
 
-1. **Direct modify is the default path.** If index entries aren't changing on UPDATE, check that `postgresPlanDirectModify` returns false (`EXPLAIN VERBOSE` shows `Foreign Update` with a remote SQL that has no `ctid`).
+1. **Direct modify is the default path.** If index entries aren't changing on UPDATE, check that `postgresPlanDirectModify` returns false for writes that touch an indexed column (`EXPLAIN VERBOSE` shows `Foreign Update` with a remote SQL that has no `ctid`).
 2. **Partition attnums can differ from the parent's.** Always map columns by name.
 3. **`COMMIT PREPARED` inside `BEGIN` fails.** The resolver needs raw connections (§6.1). In the backend, after PREPARE the session is already outside a transaction.
 4. **An `ERROR` after the local commit makes PostgreSQL PANIC** ("cannot abort transaction, it was already committed"). Use `WARNING` only in COMMIT and ABORT callbacks (I6).

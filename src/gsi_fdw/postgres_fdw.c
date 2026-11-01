@@ -213,7 +213,7 @@ typedef struct PgFdwModifyState
 	struct PgFdwModifyState *aux_fmstate;	/* foreign-insert state, if
 											 * created */
 
-	GsiModifyState *gsi;		/* GSI maintenance state, or NULL */
+	List	   *gsi;			/* GsiModifyState per GSI, or NIL */
 } PgFdwModifyState;
 
 /*
@@ -1578,7 +1578,7 @@ postgresBeginForeignScan(ForeignScanState *node, int eflags)
 	fsstate->numParams = numParams;
 	if (numParams > 0)
 		prepare_query_params((PlanState *) node,
-							 fsplan->fhttps://github.com/postgres/postgres/blob/REL_16_STABLE/src/backend/executor/nodeModifyTable.cdw_exprs,
+							 fsplan->fdw_exprs,
 							 numParams,
 							 &fsstate->param_flinfo,
 							 &fsstate->param_exprs,
@@ -1743,7 +1743,7 @@ postgresAddForeignUpdateTargets(PlannerInfo *root,
 								Relation target_relation)
 {
 	Var		   *var;
-	GsiIndex   *idx;
+	List	   *indexes;
 
 	/*
 	 * In postgres_fdw, what we need is the ctid, same as for a regular table.
@@ -1760,10 +1760,10 @@ postgresAddForeignUpdateTargets(PlannerInfo *root,
 	/* Register it as a row-identity column needed by this target rel */
 	add_row_identity_var(root, var, rtindex, "ctid");
 
-	/* GSI maintenance also needs the old key and id */
-	idx = gsi_index_for_rel(RelationGetRelid(target_relation));
-	if (idx)
-		gsi_add_update_targets(root, rtindex, target_relation, idx);
+	/* GSI maintenance also needs the old keys and id */
+	indexes = gsi_indexes_for_rel(RelationGetRelid(target_relation));
+	if (indexes != NIL)
+		gsi_add_update_targets(root, rtindex, target_relation, indexes);
 }
 
 /*
@@ -2045,8 +2045,8 @@ postgresGetForeignModifyBatchSize(ResultRelInfo *resultRelInfo)
 	Assert(fmstate == NULL || fmstate->aux_fmstate == NULL);
 
 	/* GSI maintenance runs per row */
-	if (fmstate ? fmstate->gsi != NULL :
-		gsi_index_for_rel(RelationGetRelid(resultRelInfo->ri_RelationDesc)) != NULL)
+	if (fmstate ? fmstate->gsi != NIL :
+		gsi_indexes_for_rel(RelationGetRelid(resultRelInfo->ri_RelationDesc)) != NIL)
 		return 1;
 
 	/*
@@ -2477,8 +2477,8 @@ postgresPlanDirectModify(PlannerInfo *root,
 	if (operation != CMD_UPDATE && operation != CMD_DELETE)
 		return false;
 
-	/* A direct modify would bypass the per-row GSI maintenance */
-	if (gsi_index_for_rel(planner_rt_fetch(resultRelation, root)->relid) != NULL)
+	/* A direct modify would bypass per-row GSI maintenance */
+	if (!gsi_direct_modify_ok(root, resultRelation, operation))
 		return false;
 
 	/*

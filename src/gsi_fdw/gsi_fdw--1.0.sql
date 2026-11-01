@@ -46,11 +46,12 @@ CREATE TABLE gsi.gsi_node (
 
 CREATE TABLE gsi.gsi_index (
     index_name  name PRIMARY KEY,
-    base_table  regclass NOT NULL UNIQUE,
+    base_table  regclass NOT NULL,
     column_name name NOT NULL,
     is_unique   boolean NOT NULL DEFAULT false,
     mode        text NOT NULL DEFAULT 'sync' CHECK (mode IN ('sync', 'async')),
-    status      text NOT NULL DEFAULT 'ready' CHECK (status IN ('write-only', 'ready'))
+    status      text NOT NULL DEFAULT 'ready' CHECK (status IN ('write-only', 'ready')),
+    UNIQUE (base_table, column_name)            -- one GSI per column, many per table
 );
 
 CREATE FUNCTION gsi_create(base regclass, col name, is_unique boolean DEFAULT false)
@@ -58,10 +59,11 @@ RETURNS text
 AS 'MODULE_PATHNAME'
 LANGUAGE C STRICT;
 
-CREATE FUNCTION gsi_drop(base regclass)
+-- col NULL drops every GSI of the table
+CREATE FUNCTION gsi_drop(base regclass, col name DEFAULT NULL)
 RETURNS void
 AS 'MODULE_PATHNAME'
-LANGUAGE C STRICT;
+LANGUAGE C;
 
 CREATE FUNCTION gsi_node_for(anyelement)
 RETURNS int

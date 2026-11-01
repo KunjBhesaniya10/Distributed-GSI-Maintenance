@@ -30,20 +30,22 @@ On the first remote connection in a backend, [fdw] [`GetConnection`](../src/gsi_
 
 ## 1. `SELECT gsi_create('users', 'email', true)`
 
-- [GSI] [`gsi_create`](../src/gsi_fdw/gsi.c#L399)
-  - [GSI] [`gsi_index_for_rel`](../src/gsi_fdw/gsi.c#L115): checks there's no GSI yet
-  - [PG] SPI [`SELECT 1 FROM users LIMIT 1`](../src/gsi_fdw/gsi.c#L438): emptiness check
+- [GSI] [`gsi_create`](../src/gsi_fdw/gsi.c#L511)
+  - [GSI] [`gsi_indexes_for_rel`](../src/gsi_fdw/gsi.c#L117) + [`index_on_column`](../src/gsi_fdw/gsi.c#L540): checks this column has no GSI yet (other columns may)
+  - [PG] SPI [`SELECT 1 FROM users LIMIT 1`](../src/gsi_fdw/gsi.c#L551): emptiness check
     - [fdw] foreign scan of each partition: [`postgresBeginForeignScan`](../src/gsi_fdw/postgres_fdw.c#L1492) → [`GetConnection`](../src/gsi_fdw/postgres_fdw.c#L1535) opens a remote transaction on each shard, then [`postgresIterateForeignScan`](../src/gsi_fdw/postgres_fdw.c#L1597) fetches rows
-  - [PG] SPI [`INSERT INTO gsi.gsi_index`](../src/gsi_fdw/gsi.c#L449)
-  - [GSI] [`gsi_index_for_rel`](../src/gsi_fdw/gsi.c#L456): reads the row back into a `GsiIndex`
-    - [GSI] [`gsi_load_nodes`](../src/gsi_fdw/gsi.c#L84)
-  - [GSI] [`exec_on_all_nodes`](../src/gsi_fdw/gsi.c#L380) (×2 for a unique GSI)
+  - [PG] SPI [`INSERT INTO gsi.gsi_index`](../src/gsi_fdw/gsi.c#L562)
+  - [GSI] [`gsi_indexes_for_rel`](../src/gsi_fdw/gsi.c#L569): reads the row back into a `GsiIndex`
+    - [GSI] [`gsi_load_nodes`](../src/gsi_fdw/gsi.c#L86)
+  - [GSI] [`exec_on_all_nodes`](../src/gsi_fdw/gsi.c#L475) (×2 for a unique GSI)
     - [fdw] `GetConnection`
     - [GSI] [`gsi_mark_conn(conn, true)`](../src/gsi_fdw/connection.c#L2292): enables 2PC, role `i`
     - [fdw] [`do_sql_command`](../src/gsi_fdw/connection.c#L711): `CREATE TABLE public.gsi_users_email (...)`, then `CREATE UNIQUE INDEX ... (key)`
 - COMMIT → **§7**: tables and catalog row appear everywhere or nowhere.
 
-`gsi_drop('users')`: [`gsi_drop`](../src/gsi_fdw/gsi.c#L472) → SPI [`DELETE FROM gsi.gsi_index`](../src/gsi_fdw/gsi.c#L489) → [`exec_on_all_nodes`](../src/gsi_fdw/gsi.c#L494) `DROP TABLE IF EXISTS ...` → COMMIT §7.
+A table can have several GSIs, one per column (e.g. `gsi_create('users', 'name')` next to the email GSI); every flow below then runs its GSI steps once per GSI.
+
+`gsi_drop('users', 'email')` drops one GSI; `gsi_drop('users')` drops all of them. Per GSI: [`gsi_drop`](../src/gsi_fdw/gsi.c#L588) → SPI [`DELETE FROM gsi.gsi_index WHERE index_name = ...`](../src/gsi_fdw/gsi.c#L629) → [`exec_on_all_nodes`](../src/gsi_fdw/gsi.c#L634) `DROP TABLE IF EXISTS ...` → COMMIT §7.
 
 ---
 
@@ -56,11 +58,11 @@ No GSI code. Partitions are chosen by tuple routing at execution time, so postgr
 - [PG] [`ExecFindPartition`](https://github.com/postgres/postgres/blob/REL_16_STABLE/src/backend/executor/execPartition.c) → `ExecInitRoutingInfo`
   1. [fdw] [`postgresBeginForeignInsert`](../src/gsi_fdw/postgres_fdw.c#L2160)
      - [fdw] [`create_foreign_modify`](../src/gsi_fdw/postgres_fdw.c#L3994) → `GetConnection` (base shard)
-       - [GSI] [`gsi_begin_modify`](../src/gsi_fdw/gsi.c#L219), called at [L4103](../src/gsi_fdw/postgres_fdw.c#L4103); its result is stored in `fmstate->gsi`
-         - [GSI] [`gsi_index_for_rel`](../src/gsi_fdw/gsi.c#L115) → [`gsi_load_nodes`](../src/gsi_fdw/gsi.c#L84)
-         - [GSI] [`server_node`](../src/gsi_fdw/gsi.c#L183): this partition's `base_node`
-         - [PG] [`GetTopFullTransactionId`](../src/gsi_fdw/gsi.c#L261): forces a coordinator xid
-  2. [fdw]+[GSI] [`postgresGetForeignModifyBatchSize`](../src/gsi_fdw/postgres_fdw.c#L2032): [GSI check, L2048](../src/gsi_fdw/postgres_fdw.c#L2048) reads `fmstate->gsi` and returns **1**. In this routed path `fmstate` always exists. The `gsi_index_for_rel` fallback is for `ExecInitModifyTable` under plain `EXPLAIN` of an INSERT aimed directly at a partition (e.g. `users_p0`), where `BeginForeignModify` skips creating `fmstate`.
+       - [GSI] [`gsi_begin_modify`](../src/gsi_fdw/gsi.c#L283), called at [L4103](../src/gsi_fdw/postgres_fdw.c#L4103); its result (a List with one `GsiModifyState` per GSI) is stored in `fmstate->gsi`
+         - [GSI] [`gsi_indexes_for_rel`](../src/gsi_fdw/gsi.c#L117) → [`gsi_load_nodes`](../src/gsi_fdw/gsi.c#L86)
+         - [GSI] [`gsi_server_node`](../src/gsi_fdw/gsi.c#L319): this partition's `base_node`
+         - [PG] [`GetTopFullTransactionId`](../src/gsi_fdw/gsi.c#L339): forces a coordinator xid
+  2. [fdw]+[GSI] [`postgresGetForeignModifyBatchSize`](../src/gsi_fdw/postgres_fdw.c#L2032): [GSI check, L2048](../src/gsi_fdw/postgres_fdw.c#L2048) reads `fmstate->gsi` and returns **1**. In this routed path `fmstate` always exists. The `gsi_indexes_for_rel` fallback is for `ExecInitModifyTable` under plain `EXPLAIN` of an INSERT aimed directly at a partition (e.g. `users_p0`), where `BeginForeignModify` skips creating `fmstate`.
 
 ### Per row
 - [PG] [`ExecInsert`](https://github.com/postgres/postgres/blob/REL_16_STABLE/src/backend/executor/nodeModifyTable.c)
@@ -68,14 +70,14 @@ No GSI code. Partitions are chosen by tuple routing at execution time, so postgr
     - [fdw] [`execute_foreign_modify`](../src/gsi_fdw/postgres_fdw.c#L4116)
       - [fdw] [`prepare_foreign_modify`](../src/gsi_fdw/postgres_fdw.c#L4246) (first row): libpq `PQsendPrepare` of `INSERT INTO users_shard ...` (a protocol-level prepared statement, unrelated to `PREPARE TRANSACTION`)
       - [GSI] [`gsi_mark_conn(base_conn, false)`](../src/gsi_fdw/postgres_fdw.c#L4187): enables 2PC
-      - [GSI] [`gsi_capture_row`](../src/gsi_fdw/gsi.c#L281), called at [L4188](../src/gsi_fdw/postgres_fdw.c#L4188)
-        - [GSI] [`key_text`](../src/gsi_fdw/gsi.c#L267) → [`gsi_node_for_datum`](../src/gsi_fdw/gsi.c#L167): `new_key`, `new_node`
+      - [GSI] [`gsi_capture_row`](../src/gsi_fdw/gsi.c#L402), called at [L4188](../src/gsi_fdw/postgres_fdw.c#L4188), runs [`capture_one`](../src/gsi_fdw/gsi.c#L358) per GSI
+        - [GSI] [`key_text`](../src/gsi_fdw/gsi.c#L344) → [`gsi_node_for_datum`](../src/gsi_fdw/gsi.c#L181): `new_key`, `new_node` (a NULL key gets no entry)
       - [fdw] [**base write**](../src/gsi_fdw/postgres_fdw.c#L4194): `PQsendQueryPrepared` runs the insert on the base shard
-      - [GSI] [`gsi_apply_row`](../src/gsi_fdw/gsi.c#L370), called at [L4231](../src/gsi_fdw/postgres_fdw.c#L4231)
-        - [GSI] [`send_index_op(insert)`](../src/gsi_fdw/gsi.c#L325)
+      - [GSI] [`gsi_apply_row`](../src/gsi_fdw/gsi.c#L458), called at [L4231](../src/gsi_fdw/postgres_fdw.c#L4231), per GSI:
+        - [GSI] [`send_index_op(insert)`](../src/gsi_fdw/gsi.c#L413)
           - [fdw] `GetConnection` (index node; opens a remote transaction there if needed)
-          - [GSI] `gsi_mark_conn(idx_conn, true)` ([L334](../src/gsi_fdw/gsi.c#L334)): role `i`
-          - [GSI] [`PQsendQueryParams`](../src/gsi_fdw/gsi.c#L346): `INSERT INTO public.gsi_users_email (key, id, shard) VALUES (...)`
+          - [GSI] `gsi_mark_conn(idx_conn, true)` ([L423](../src/gsi_fdw/gsi.c#L423)): role `i`
+          - [GSI] [`PQsendQueryParams`](../src/gsi_fdw/gsi.c#L435): `INSERT INTO public.gsi_users_email (key, id, shard) VALUES (...)`
           - [fdw] [`pgfdw_get_result`](../src/gsi_fdw/connection.c#L873). On error: [`pgfdw_report_error`](../src/gsi_fdw/connection.c#L938), e.g. **23505** for a unique GSI, which goes to the abort path in §8
 
 `COPY users FROM ...` and `INSERT ... SELECT` follow the same per-row path.
@@ -87,19 +89,19 @@ No GSI code. Partitions are chosen by tuple routing at execution time, so postgr
 ### Planning
 - [PG] `query_planner` → `add_other_rels_to_query` → [`expand_inherited_rtentry`](https://github.com/postgres/postgres/blob/REL_16_STABLE/src/backend/optimizer/util/inherit.c) → `expand_single_inheritance_child` → [`add_row_identity_columns`](https://github.com/postgres/postgres/blob/REL_16_STABLE/src/backend/optimizer/util/appendinfo.c) (once per partition)
   - [fdw]+[GSI] [`postgresAddForeignUpdateTargets`](../src/gsi_fdw/postgres_fdw.c#L1740): `ctid` (fdw), then [L1766](../src/gsi_fdw/postgres_fdw.c#L1766):
-    - [GSI] [`gsi_add_update_targets`](../src/gsi_fdw/gsi.c#L211)
-      - [GSI] [`add_junk_column`](../src/gsi_fdw/gsi.c#L193) ×2 → [PG] [`add_row_identity_var`](https://github.com/postgres/postgres/blob/REL_16_STABLE/src/backend/optimizer/util/appendinfo.c): `gsi_old_key`, `gsi_old_id`
+    - [GSI] [`gsi_add_update_targets`](../src/gsi_fdw/gsi.c#L236)
+      - [GSI] [`add_junk_column`](../src/gsi_fdw/gsi.c#L207) once per GSI plus once for id → [PG] [`add_row_identity_var`](https://github.com/postgres/postgres/blob/REL_16_STABLE/src/backend/optimizer/util/appendinfo.c): `gsi_old_key_users_email`, ..., `gsi_old_id`
 - [PG] [`make_modifytable`](https://github.com/postgres/postgres/blob/REL_16_STABLE/src/backend/optimizer/plan/createplan.c)
-  - [fdw]+[GSI] [`postgresPlanDirectModify`](../src/gsi_fdw/postgres_fdw.c#L2451): [GSI check, L2481](../src/gsi_fdw/postgres_fdw.c#L2481) returns **false**, so no pushdown
+  - [fdw]+[GSI] [`postgresPlanDirectModify`](../src/gsi_fdw/postgres_fdw.c#L2451): [GSI check, L2481](../src/gsi_fdw/postgres_fdw.c#L2481) → [`gsi_direct_modify_ok`](../src/gsi_fdw/gsi.c#L257): the UPDATE sets an indexed column, so it returns **false** and there is no pushdown
   - [fdw] [`postgresPlanForeignModify`](../src/gsi_fdw/postgres_fdw.c#L1774): deparses the per-row `UPDATE users_shard SET ... WHERE ctid = $1`
 - Result: remote scan `SELECT ..., email, id, ctid FROM users_shard WHERE name = 'A' FOR UPDATE`
 
 ### Executor start (per unpruned partition, even if it ends up with no rows)
 - [PG] `ExecInitModifyTable`
   - [fdw] [`postgresBeginForeignModify`](../src/gsi_fdw/postgres_fdw.c#L1913) → [`create_foreign_modify`](../src/gsi_fdw/postgres_fdw.c#L3994)
-    - [GSI] [`gsi_begin_modify`](../src/gsi_fdw/gsi.c#L219)
-      - [PG] [`ExecFindJunkAttributeInTlist`](../src/gsi_fdw/gsi.c#L241) ×2: positions of the junk columns
-      - `key_updated = true`; an `id` assignment raises an [ERROR](../src/gsi_fdw/gsi.c#L257) (see §3b)
+    - [GSI] [`gsi_begin_modify`](../src/gsi_fdw/gsi.c#L283)
+      - [PG] [`ExecFindJunkAttributeInTlist`](../src/gsi_fdw/gsi.c#L299): position of `gsi_old_id`, then [one per GSI](../src/gsi_fdw/gsi.c#L328) for its old key
+      - an `id` assignment raises an [ERROR](../src/gsi_fdw/gsi.c#L309) (see §3b); `key_updated = true` for the email GSI
       - [PG] `GetTopFullTransactionId`
 
 ### Per row
@@ -108,18 +110,18 @@ No GSI code. Partitions are chosen by tuple routing at execution time, so postgr
 - [PG] [`ExecUpdate`](https://github.com/postgres/postgres/blob/REL_16_STABLE/src/backend/executor/nodeModifyTable.c)
   - [fdw] [`postgresExecForeignUpdate`](../src/gsi_fdw/postgres_fdw.c#L2104) → [`execute_foreign_modify`](../src/gsi_fdw/postgres_fdw.c#L4116)
     - [GSI] `gsi_mark_conn(base_conn, false)`
-    - [GSI] [`gsi_capture_row`](../src/gsi_fdw/gsi.c#L281): `old_key` and `old_id` from `planSlot` junk, `new_key` from `slot`, each via `key_text` → `gsi_node_for_datum`
+    - [GSI] [`gsi_capture_row`](../src/gsi_fdw/gsi.c#L402), per GSI: `old_key` and `old_id` from `planSlot` junk, `new_key` from `slot` (or the old key if this GSI's column isn't assigned), each via `key_text` → `gsi_node_for_datum`
     - [fdw] **base write**: `UPDATE users_shard SET email = $2 WHERE ctid = $1`
-    - [GSI] [`gsi_apply_row`](../src/gsi_fdw/gsi.c#L370)
+    - [GSI] [`gsi_apply_row`](../src/gsi_fdw/gsi.c#L458), per GSI whose key changed:
       - [GSI] `send_index_op(delete)`: `DELETE FROM public.gsi_users_email WHERE key = $1 AND id = $2` on `hash(old_key)`
-        - [GSI] [rows ≠ 1 → **40001**](../src/gsi_fdw/gsi.c#L357) (stale remote snapshot), which goes to §8
+        - [GSI] [rows ≠ 1 → **40001**](../src/gsi_fdw/gsi.c#L450) (stale remote snapshot), which goes to §8
       - [GSI] `send_index_op(insert)`: `INSERT (...)` on `hash(new_key)` (23505 possible)
 
-### 3a. `UPDATE users SET name = 'Z' ...` (key unchanged)
-Same path, but `key_updated = false`. [`gsi_capture_row`](../src/gsi_fdw/gsi.c#L317) clears both keys, so `gsi_apply_row` sends nothing.
+### 3a. `UPDATE users SET name = 'Z' ...` (no indexed column assigned)
+If no GSI covers `name`, [`gsi_direct_modify_ok`](../src/gsi_fdw/gsi.c#L257) returns **true**: the UPDATE can't change an index entry, so postgres_fdw pushes it down whole (`UPDATE users_shard SET name = 'Z' WHERE ...`) with no per-row callbacks, exactly as upstream. If the statement also needs a local filter or a join, postgres_fdw falls back to the per-row path; there [`capture_one`](../src/gsi_fdw/gsi.c#L398) sees an unchanged key, clears it, and `gsi_apply_row` sends nothing. A pushed-down UPDATE commits with plain `COMMIT` unless the same transaction wrote a GSI, in which case §7 prepares its shards too.
 
 ### 3b. `UPDATE users SET id = ...`
-Stops in [`gsi_begin_modify`](../src/gsi_fdw/gsi.c#L257): `ERROR: cannot update column "id"`, then §8.
+Stops in [`gsi_begin_modify`](../src/gsi_fdw/gsi.c#L309): `ERROR: cannot update column "id"`, then §8.
 
 ---
 
@@ -136,23 +138,42 @@ Stops in [`gsi_begin_modify`](../src/gsi_fdw/gsi.c#L257): `ERROR: cannot update 
 
 ---
 
-## 5. `SELECT * FROM users WHERE email = 'a@x'` (read path not implemented yet)
+## 5. `SELECT * FROM users WHERE email = 'a@x'` (GSI read path, M8)
 
-- [PG] planner, per partition:
-  - `set_append_rel_size` → [fdw] [`postgresGetForeignRelSize`](../src/gsi_fdw/postgres_fdw.c#L626)
-  - `set_append_rel_pathlist` → [fdw] [`postgresGetForeignPaths`](../src/gsi_fdw/postgres_fdw.c#L1014)
-  - `create_plan` → [fdw] [`postgresGetForeignPlan`](../src/gsi_fdw/postgres_fdw.c#L1223)
-- [PG] executor: `Append`, then per partition:
-  - [fdw] [`postgresBeginForeignScan`](../src/gsi_fdw/postgres_fdw.c#L1492) → `GetConnection`
-  - [fdw] [`postgresIterateForeignScan`](../src/gsi_fdw/postgres_fdw.c#L1597) → [`create_cursor`](../src/gsi_fdw/postgres_fdw.c#L3746) / [`fetch_more_data`](../src/gsi_fdw/postgres_fdw.c#L3822): `DECLARE c1 CURSOR FOR SELECT ... WHERE email = 'a@x'`, then `FETCH`, on **every** shard
+### Planning
+- [PG] planner: each partition is planned as usual ([fdw] `postgresGetForeignRelSize`, `postgresGetForeignPaths`), and the broadcast Append is built
+- [PG] `set_rel_pathlist` for the partitioned parent, then calls `set_rel_pathlist_hook`
+  - [GSI] [`gsi_set_rel_pathlist`](../src/gsi_fdw/gsi_scan.c#L137-L201)
+    - checks: partitioned base rel, not dummy, not a write target, no `FOR UPDATE`
+    - [GSI] [`gsi_indexes_for_rel`](../src/gsi_fdw/gsi.c#L117), then for each ready GSI [`find_key_clause`](../src/gsi_fdw/gsi_scan.c#L102-L135): `email = Const/Param`. If several GSIs match (e.g. `email = ... AND name = ...`), a unique one wins
+    - [PG] `add_path`: CustomPath, cost 0.1 × the Append; `custom_private` = key + chosen index name
+    - clears `rel->part_scheme`, so [PG] `apply_scanjoin_target_to_paths` keeps our path instead of rebuilding the Append
+- [PG] `create_plan` → `create_customscan_plan` → [GSI] [`gsi_plan_path`](../src/gsi_fdw/gsi_scan.c#L203-L218): `CustomScan`, with every qual as the filter
 
-No GSI code runs. M8 adds `set_rel_pathlist_hook` → `GsiLookup` CustomScan.
+### Executor start
+- [PG] `ExecInitCustomScan` (opens `users`, makes the scan slot) → [GSI] [`gsi_create_scan_state`](../src/gsi_fdw/gsi_scan.c#L220-L228), then [`gsi_begin_scan`](../src/gsi_fdw/gsi_scan.c#L266-L320)
+  - `ExecInitExpr(key)`; [`gsi_indexes_for_rel`](../src/gsi_fdw/gsi.c#L117), picking the plan's GSI by [name](../src/gsi_fdw/gsi_scan.c#L92-L96)
+  - `find_inheritance_children` → per partition [`remote_table`](../src/gsi_fdw/gsi_scan.c#L247-L264) / [`remote_column`](../src/gsi_fdw/gsi_scan.c#L231-L244) → `SELECT <cols> FROM public.users_shard WHERE id = ANY($1)`
+
+### Per row
+- [PG] `ExecCustomScan` → [GSI] [`gsi_exec_scan`](../src/gsi_fdw/gsi_scan.c#L442-L446) → [PG] `ExecScan(gsi_next, gsi_recheck)`
+  - [GSI] [`gsi_next`](../src/gsi_fdw/gsi_scan.c#L416-L433), first call: [`gsi_fetch`](../src/gsi_fdw/gsi_scan.c#L339-L414)
+    - evaluate the key → [`gsi_node_for_datum`](../src/gsi_fdw/gsi.c#L181) → index node
+    - **hop 1**, [`remote_query`](../src/gsi_fdw/gsi_scan.c#L323-L336) → [fdw] `GetConnection` → `SELECT id, shard FROM public.gsi_users_email WHERE key = $1`
+    - group the ids by `shard`
+    - **hop 2**, for each listed shard only: `remote_query` → `SELECT ... WHERE id = ANY('{...}')`
+    - [fdw] `set_transmission_modes`; [PG] `BuildTupleFromCStrings` → buffer
+  - each call returns the next buffered row (`ExecForceStoreHeapTuple`)
+  - [PG] `ExecScan` evaluates the plan filter `email = 'a@x'`: **the recheck**, which drops stale entries
+
+### Not routed through the GSI
+`UPDATE/DELETE ... WHERE email = ?` (the table is the write target), `FOR UPDATE`, non-equality predicates, and join-parameterized keys all fall back to the broadcast Append, and their results are still correct.
 
 ---
 
 ## 6. Any statement on a table without a GSI
 
-Every [GSI] check ([L2048](../src/gsi_fdw/postgres_fdw.c#L2048), [L2481](../src/gsi_fdw/postgres_fdw.c#L2481), [L1766](../src/gsi_fdw/postgres_fdw.c#L1766), [L4103](../src/gsi_fdw/postgres_fdw.c#L4103)) gets `NULL` from `gsi_index_for_rel`, so `gsi_xact_2pc` stays false. The behaviour is exactly upstream postgres_fdw: direct modify, batching and a plain `COMMIT TRANSACTION` per shard.
+Every [GSI] check ([L2048](../src/gsi_fdw/postgres_fdw.c#L2048), [L2481](../src/gsi_fdw/postgres_fdw.c#L2481), [L1764](../src/gsi_fdw/postgres_fdw.c#L1764), [L4103](../src/gsi_fdw/postgres_fdw.c#L4103)) gets `NIL` from `gsi_indexes_for_rel`, so `gsi_xact_2pc` stays false. The behaviour is exactly upstream postgres_fdw: direct modify, batching and a plain `COMMIT TRANSACTION` per shard.
 
 ---
 
@@ -167,7 +188,7 @@ Every [GSI] check ([L2048](../src/gsi_fdw/postgres_fdw.c#L2048), [L2481](../src/
           - [`PREPARE TRANSACTION 'gsi_<fxid>_<server>_<i|b>'`](../src/gsi_fdw/connection.c#L2336) via [fdw] [`pgfdw_exec_query`](../src/gsi_fdw/connection.c#L845)
           - [status check](../src/gsi_fdw/connection.c#L2342): a reply of `ROLLBACK` instead of `PREPARE` raises ERROR, which goes to §8
         - [fdw] [`pgfdw_reset_xact_state`](../src/gsi_fdw/connection.c#L1353) ([L1125](../src/gsi_fdw/connection.c#L1125)): the remote session is now outside any transaction
-      - [GSI] [`gsi_fail_point("after_prepare")`](../src/gsi_fdw/connection.c#L1147) → [`gsi_fail_point`](../src/gsi_fdw/gsi.c#L72)
+      - [GSI] [`gsi_fail_point("after_prepare")`](../src/gsi_fdw/connection.c#L1147) → [`gsi_fail_point`](../src/gsi_fdw/gsi.c#L74)
   - [PG] `RecordTransactionCommit`: **the commit record is flushed. This is the decision.**
   - [PG] `CallXactCallbacks(XACT_EVENT_COMMIT)` (interrupts are held)
     - [fdw]+[GSI] `pgfdw_xact_callback`, at [L1005](../src/gsi_fdw/connection.c#L1005):
@@ -194,7 +215,7 @@ Every [GSI] check ([L2048](../src/gsi_fdw/postgres_fdw.c#L2048), [L2481](../src/
 
 ## 9. Crash during commit (`SET gsi.fail_point = '...'`)
 
-- [GSI] [`gsi_fail_point`](../src/gsi_fdw/gsi.c#L72): `LOG`, then `abort()`
+- [GSI] [`gsi_fail_point`](../src/gsi_fdw/gsi.c#L75): `LOG`, then `abort()`
 - [PG] postmaster: the child died, so it terminates all backends and runs crash recovery. The xid becomes *aborted* unless its commit record was flushed.
 - Remote prepared transactions stay on the shards, holding their locks, until §10.
 
@@ -202,17 +223,24 @@ Every [GSI] check ([L2048](../src/gsi_fdw/postgres_fdw.c#L2048), [L2481](../src/
 
 ## 10. `SELECT gsi_resolve(0)`
 
-- [GSI] [`gsi_resolve`](../src/gsi_fdw/gsi_resolver.c#L191) → [`gsi_resolve_all`](../src/gsi_fdw/gsi_resolver.c#L138)
-  - [GSI] [`gsi_load_nodes`](../src/gsi_fdw/gsi.c#L84)
-  - per node, [GSI] [`collect_node`](../src/gsi_fdw/gsi_resolver.c#L70)
+- [GSI] [`gsi_resolve`](../src/gsi_fdw/gsi_resolver.c#L209) → [`gsi_resolve_all`](../src/gsi_fdw/gsi_resolver.c#L156)
+  - [GSI] [`gsi_load_nodes`](../src/gsi_fdw/gsi.c#L86)
+  - per node, [GSI] [`collect_node`](../src/gsi_fdw/gsi_resolver.c#L88)
     - [GSI] [`gsi_connect_raw`](../src/gsi_fdw/connection.c#L2399) → [fdw] `connect_pg_server` (no transaction, not cached)
-    - [`SELECT gid FROM pg_prepared_xacts WHERE gid LIKE 'gsi\_%' AND prepared < now() - grace`](../src/gsi_fdw/gsi_resolver.c#L98)
-    - [GSI] [`parse_gid`](../src/gsi_fdw/gsi_resolver.c#L57): fxid and role
+    - [`SELECT gid FROM pg_prepared_xacts WHERE gid LIKE 'gsi\_%' AND prepared < now() - grace`](../src/gsi_fdw/gsi_resolver.c#L116)
+    - [GSI] [`parse_gid`](../src/gsi_fdw/gsi_resolver.c#L75): fxid and role
   - pass 0 (`i`), then pass 1 (`b`), per GID:
-    - [GSI] [`xact_status`](../src/gsi_fdw/gsi_resolver.c#L37): SPI [`pg_xact_status(fxid::xid8)`](../src/gsi_fdw/gsi_resolver.c#L48) on the coordinator
-    - committed or aborted → [GSI] [`finish`](../src/gsi_fdw/gsi_resolver.c#L120): `COMMIT PREPARED` / `ROLLBACK PREPARED`. [42704](../src/gsi_fdw/gsi_resolver.c#L128) (already finished by its backend) is logged as success, not as a warning, but isn't counted in the returned number
+    - [GSI] [`xact_status`](../src/gsi_fdw/gsi_resolver.c#L55): SPI [`pg_xact_status(fxid::xid8)`](../src/gsi_fdw/gsi_resolver.c#L66) on the coordinator
+    - committed or aborted → [GSI] [`finish`](../src/gsi_fdw/gsi_resolver.c#L138): `COMMIT PREPARED` / `ROLLBACK PREPARED`. [42704](../src/gsi_fdw/gsi_resolver.c#L146) (already finished by its backend) is logged as success, not as a warning, but isn't counted in the returned number
     - in progress or unknown → skip
-  - [`gsi_disconnect_raw`](../src/gsi_fdw/gsi_resolver.c#L181) for every connection
+  - [`gsi_disconnect_raw`](../src/gsi_fdw/gsi_resolver.c#L199) for every connection
+
+---
+
+## 10b. Background resolver (M7)
+- [PG] postmaster starts the `gsi resolver` worker (registered by [`gsi_resolver_init`](../src/gsi_fdw/gsi_resolver.c#L266-L308)), and restarts it 5 s after any crash
+  - [GSI] [`gsi_resolver_main`](../src/gsi_fdw/gsi_resolver.c#L242-L264): connect to `gsi.resolver_database`; loop `WaitLatch(gsi.resolver_interval)`
+    - [GSI] [`resolver_pass`](../src/gsi_fdw/gsi_resolver.c#L215-L240): transaction + snapshot → [`gsi_resolve_all(gsi.resolver_grace)`](../src/gsi_fdw/gsi_resolver.c#L156), exactly as in §10, but only for GIDs older than the grace period, so it never races a live commit
 
 ---
 

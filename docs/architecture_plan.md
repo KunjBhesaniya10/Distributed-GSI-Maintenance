@@ -118,9 +118,9 @@ Optional. Hashing destroys key order, so send the range to **all** index nodes i
 ### 7.1 Intercepting row changes
 | Change in `gsi_fdw` | Why |
 |---|---|
-| `PlanDirectModify` returns false for GSI tables | Otherwise `UPDATE ... WHERE` is pushed down whole and the per-row callbacks never run. |
+| `PlanDirectModify` returns false for writes that can change an index entry (DELETE, UPDATE of an indexed column or `id`) | Otherwise `UPDATE ... WHERE` is pushed down whole and the per-row callbacks never run. An UPDATE of other columns keeps the pushdown: it can't change any entry. |
 | `GetForeignModifyBatchSize` returns 1 | Same reason for batched `INSERT`. |
-| `AddForeignUpdateTargets` adds the indexed column | `UPDATE`/`DELETE` need the **old key** to find the old entry. |
+| `AddForeignUpdateTargets` adds every indexed column (one junk column per GSI) and `id` | `UPDATE`/`DELETE` need the **old keys** to find the old entries. |
 
 Per-row actions. Each index statement runs **immediately** on the index node's connection, inside that connection's remote transaction:
 

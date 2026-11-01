@@ -22,7 +22,7 @@
 
 typedef struct GsiIndex
 {
-	char	   *name;			/* e.g. users_email */
+	char	   *name;			/* e.g. users_email; one GSI per column */
 	char	   *remote_table;	/* quoted public.gsi_<name> */
 	char	   *column;			/* indexed column name */
 	Oid			typid;
@@ -33,7 +33,10 @@ typedef struct GsiIndex
 	Oid		   *servers;		/* foreign server of each node id */
 } GsiIndex;
 
-/* Per-partition write state, built by create_foreign_modify */
+/*
+ * Per-partition write state for one GSI, built by create_foreign_modify.
+ * A table with several GSIs gets a List of these.
+ */
 typedef struct GsiModifyState
 {
 	GsiIndex   *idx;
@@ -58,19 +61,26 @@ typedef struct GsiModifyState
 extern int	gsi_remote_lock_timeout;
 extern void gsi_init(void);
 extern Oid *gsi_load_nodes(int *nnodes, MemoryContext cxt);
-extern GsiIndex *gsi_index_for_rel(Oid relid);
+extern List *gsi_indexes_for_rel(Oid relid);
 extern int	gsi_node_for_datum(Datum value, Oid typid, Oid collid, int nnodes);
+extern int	gsi_server_node(GsiIndex *idx, Oid serverid);
 extern void gsi_add_update_targets(PlannerInfo *root, Index rtindex,
-								   Relation rel, GsiIndex *idx);
-extern GsiModifyState *gsi_begin_modify(Relation rel, CmdType operation,
-										Plan *subplan, List *target_attrs);
-extern void gsi_capture_row(GsiModifyState *gs, CmdType operation,
+								   Relation rel, List *indexes);
+extern bool gsi_direct_modify_ok(PlannerInfo *root, Index rtindex,
+								 CmdType operation);
+extern List *gsi_begin_modify(Relation rel, CmdType operation,
+							  Plan *subplan, List *target_attrs);
+extern void gsi_capture_row(List *states, CmdType operation,
 							TupleTableSlot *slot, TupleTableSlot *planSlot);
-extern void gsi_apply_row(GsiModifyState *gs);
+extern void gsi_apply_row(List *states);
 extern void gsi_fail_point(const char *name);
 
 /* gsi_resolver.c */
 extern int	gsi_resolve_all(int grace_secs);
+extern void gsi_resolver_init(void);
+
+/* gsi_scan.c */
+extern void gsi_scan_init(void);
 
 /* connection.c */
 extern void gsi_mark_conn(PGconn *conn, bool is_index);

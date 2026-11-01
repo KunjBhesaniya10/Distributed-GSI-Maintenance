@@ -14,7 +14,7 @@ When a table is sharded across PostgreSQL servers by primary key, a query on ano
 
 ## Core idea
 
-- There is **one GSI per indexed column**, split into pieces across nodes. The entry for key `k` lives on index node `hash(k) mod N`, independently of where the base row lives. That is what makes it *global*.
+- There is **one GSI per indexed column**, and a table can have several (one per column), each split into pieces across nodes. The entry for key `k` lives on index node `hash(k) mod N`, independently of where the base row lives. That is what makes it *global*.
 - Entries are **one per row**: `(key, id, shard)`, not `key -> set of shards`. The per-row form gives exact primary-key fetches, enables global uniqueness via a unique B-tree, and makes delete and update maintenance exact.
 - A lookup is two hops: hash the key, ask one index node, then fetch `WHERE id = ANY(...)` from only the shards it returned.
 - Every write touches two nodes (base shard and index node), so they must be kept consistent. That is the central challenge.
@@ -48,7 +48,7 @@ The submitted proposal lists all of these as goals, but in practice sync is the 
 ### Synchronous write path
 - `ExecForeignInsert/Update/Delete` call the original postgres_fdw routine, then queue an index operation (insert new key; delete old key on UPDATE or DELETE).
 - `AddForeignUpdateTargets` also fetches the **old value of the indexed column**, so UPDATE and DELETE know which entry to remove.
-- **Direct modify and batch insert are disabled** for GSI tables (`PlanDirectModify` returns false). Otherwise postgres_fdw pushes the whole `UPDATE ... WHERE` to the remote node and the per-row callbacks never run.
+- **Direct modify is disabled for writes that can change an index entry** (DELETE, UPDATE of an indexed column or `id`), and **batch insert is disabled** for GSI tables. Otherwise postgres_fdw pushes the whole `UPDATE ... WHERE` to the remote node and the per-row callbacks never run. An UPDATE of non-indexed columns keeps postgres_fdw's pushdown and plain commit.
 - Queued index ops go to the owning index node over a postgres_fdw connection, inside that connection's remote transaction.
 
 ### Atomic commit (2PC)
@@ -109,7 +109,7 @@ Everything else builds on these.
 - `docs/implementation_plan.md` is the **locked build plan** (interfaces, milestones, invariants). Follow it; it overrides older details in this file where they differ, e.g. index writes run immediately per row rather than being queued, GIDs are `gsi_<fxid>_<server>_<i|b>`, and nodes are listed in `gsi.gsi_node`.
 - `docs/architecture_plan.md` explains the design rationale.
 - `docs/progress.md` is the verification log shown to the professor. After finishing a milestone, add an entry with the exact test commands, their output and the checker result. Never mark something done without that evidence.
-- Expectations are high: the team had about 2 months and has already done the core course. As of 2026-10-28 only 3-4 days remain before checkpoint 1, and only the design exists. Checkpoint 1 target: M1-M5 working and verified, M6 (manual resolver + fail points) if possible. Everything else (read path, background resolver, benchmarks, stretch) is presented as the plan for after the checkpoint.
+- Expectations are high: the team had about 2 months and has already done the core course. As of 2026-10-28 only 3-4 days remain before checkpoint 1, and only the design exists. Checkpoint 1 target (revised): M1-M8 working and verified, i.e. including the background resolver and the GsiLookup read path (done 2026-10-29, see docs/progress.md). After the checkpoint: full benchmarks (M9), then online build and async mode.
 
 ## Notes for the assistant
 - Target PostgreSQL's C extension APIs (FDW callbacks, planner hooks, CustomScan, background workers, logical decoding). Match postgres_fdw's code style when editing the copied module.

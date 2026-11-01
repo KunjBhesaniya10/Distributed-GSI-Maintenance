@@ -1,0 +1,150 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage[margin=2cm]{geometry}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage{booktabs}
+\usepackage{enumitem}
+\usepackage[hidelinks]{hyperref}
+\setlist{nosep,leftmargin=*}
+\setlength{\parindent}{0pt}
+\setlength{\parskip}{4pt}
+
+\begin{document}
+
+\begin{center}
+  {\Large\bfseries Distributed Global Secondary Index Maintenance for Sharded PostgreSQL}\\[4pt]
+  Kunj Bhesaniya (23B0995) \quad Dhruvraj Merchant (23B1041) \quad
+  Dipen Sojitra (23B0913) \quad Harshil Solanki (23B1016)\\[2pt]
+  {\small CS 631 \textperiodcentered{} Checkpoint 1 progress report \textperiodcentered{} 2 November 2026}
+\end{center}
+
+\section*{Problem}
+When a table is sharded across PostgreSQL servers by primary key, a query on another column
+(\texttt{WHERE email = ?}) must ask every shard, and \texttt{UNIQUE(email)} cannot be enforced because
+each shard sees only its own rows. Spanner, CockroachDB and TiDB solve this with a \emph{global
+secondary index} (GSI); core PostgreSQL and Citus have none. We build a GSI whose entry for key $k$
+lives on node $\mathrm{hash}(k) \bmod N$, independent of where the row lives. Every write then touches
+two nodes, so the core challenge is \textbf{keeping base table and index consistent under concurrent
+writes and node crashes}.
+
+\section*{Status}
+The full synchronous GSI works end to end. We planned milestones M1--M6 for this checkpoint and
+finished M1--M8.
+
+\begin{center}
+\begin{tabular}{lll}
+\toprule
+Part & Milestones & Status \\
+\midrule
+Setup: cluster, module, catalog          & M1, M2     & Done \\
+Reads: plan selection, GsiLookup         & M8         & Done \\
+Writes: interception, 2PC, uniqueness    & M3, M4, M5 & Done \\
+Recovery: resolver, background worker    & M6, M7     & Done \\
+Stress test and benchmarks               & M9         & Stress test done; benchmarks pending \\
+Online index build, async mode           & Stretch    & After checkpoint \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\section{Setup: cluster, connections and GSI catalog}
+All our code is one PostgreSQL C extension, \texttt{gsi\_fdw}: a modified copy of
+\texttt{postgres\_fdw} (PostgreSQL's wrapper for remote servers) plus about 1,500 lines of our own code.
+\begin{itemize}
+  \item \textbf{Cluster:} Docker Compose, 1 coordinator and 3 data nodes (PostgreSQL 16). On the
+        coordinator, \texttt{users} is hash-partitioned by \texttt{id}; each partition is a foreign
+        table on one data node, so PostgreSQL's partition routing sends each row to its shard.
+  \item \textbf{Connections:} we reuse postgres\_fdw's connection cache and per-node remote
+        transactions, so index writes join the same transaction as the base write.
+  \item \textbf{Catalog:} the coordinator stores the nodes (\texttt{gsi.gsi\_node}) and indexes
+        (\texttt{gsi.gsi\_index}). \texttt{gsi\_create('users','email',unique)} creates
+        \texttt{gsi\_users\_email(key, id, shard)} on every node. A table can have several GSIs,
+        one per column.
+  \item \textbf{Placement:} $\mathrm{hash}(k) \bmod N$ with the hash PostgreSQL uses for hash
+        partitioning; one C function serves writes, reads and the checker.
+  \item \textbf{One entry per row} \texttt{(key, id, shard)}: exact primary-key fetches, exact
+        deletes, and a unique B-tree for global uniqueness.
+\end{itemize}
+
+\section{Reads: GSI plan selection and query routing}
+A lookup on the indexed column asks one index node and only the shards that hold matching rows.
+\begin{itemize}
+  \item \textbf{Plan selection:} a planner hook (\texttt{set\_rel\_pathlist\_hook}) sees
+        \texttt{WHERE email = <value>} (or any column with a ready GSI) and adds our plan, a
+        \textbf{GsiLookup CustomScan}, next to PostgreSQL's ``scan all shards'' plan (Append).
+  \item \textbf{Two hops:} (1) hash the key and ask that index node for \texttt{(id, shard)};
+        (2) fetch \texttt{WHERE id = ANY(...)} from only those shards.
+  \item \textbf{Recheck:} all original conditions are re-evaluated on fetched rows, so a stale
+        index entry can never produce a wrong result.
+  \item \textbf{Planner issue solved:} PostgreSQL rebuilds all plans of a partitioned table late in
+        planning (\texttt{apply\_scanjoin\_target\_to\_paths}), which dropped our plan. After pruning
+        we mark the table non-partitioned for that query, so our plan survives.
+  \item \texttt{EXPLAIN} shows \texttt{Custom Scan (GsiLookup) on users} with the index node and
+        number of shards fetched. \emph{Limit:} cost is a fixed heuristic for now.
+\end{itemize}
+
+\section{Writes: index maintenance and two-phase commit}
+Every INSERT, UPDATE and DELETE changes the base row and its entry in every GSI of the table in one distributed
+transaction, committed atomically with two-phase commit (2PC).
+\begin{itemize}
+  \item \textbf{Write interception:} for writes that can change an index entry (INSERT, DELETE,
+        UPDATE of an indexed column) we disable postgres\_fdw's pushdown and batching, so our
+        per-row hooks run; other UPDATEs keep the pushdown. UPDATE and DELETE also fetch the
+        \emph{old} key of every indexed column, so we know which entries to remove.
+  \item \textbf{2PC} (in postgres\_fdw's commit callback):
+  \begin{enumerate}
+    \item Before commit: \texttt{PREPARE TRANSACTION 'gsi\_<xid>\_<node>\_<role>'} on every node
+          involved; any failure aborts everything.
+    \item Decision: the coordinator's own local commit (its xid is in every prepared name).
+    \item After commit: \texttt{COMMIT PREPARED} on \textbf{index nodes first, then base shards},
+          so a visible row always has its index entry.
+  \end{enumerate}
+  \item \textbf{Global uniqueness:} a unique B-tree on the index node; a duplicate aborts the whole
+        transaction, including entries already written to other GSIs. With two concurrent inserts of the same email, exactly one wins.
+  \item \textbf{Not supported:} changing \texttt{id} (foreign partitions cannot move rows between
+        shards, so we reject it instead of corrupting data).
+\end{itemize}
+
+\section{Recovery: finishing transactions after a crash}
+A crash in the middle of 2PC leaves prepared transactions holding locks. Our resolver finishes them
+by following the coordinator's recorded decision, as Citus (2PC recovery), CockroachDB (intent
+resolution) and TiDB (lock resolution) do.
+\begin{itemize}
+  \item \textbf{Resolver:} reads \texttt{pg\_prepared\_xacts} on each node, asks the coordinator
+        whether the transaction committed (\texttt{pg\_xact\_status}), then runs
+        \texttt{COMMIT PREPARED} (index nodes first) or \texttt{ROLLBACK PREPARED}.
+  \item \textbf{Background worker:} runs the resolver every 5\,s inside the coordinator; no manual step.
+  \item \textbf{Fault injection:} a test-only setting \texttt{gsi.fail\_point} crashes the coordinator
+        at an exact protocol step, since real crash windows last microseconds.
+\end{itemize}
+
+\begin{center}
+\begin{tabular}{ll}
+\toprule
+Crash point & Result after recovery \\
+\midrule
+After PREPARE, before the decision     & Rolled back: row and entry absent \\
+After the coordinator's commit         & Rolled forward: row and entry present \\
+Between index commit and base commit   & Base finished: row present \\
+Data node paused during commit         & Transaction aborts; resolver cleans up \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\section*{Limitations and plan after Checkpoint 1}
+\textbf{Limitations:} no global snapshot (during the short commit window a reader may see the entry
+before the row; the recheck keeps results correct); cross-node deadlocks are ended by a 5\,s lock
+timeout; \texttt{gsi\_create} needs an empty table; one GSI per column (several per table); only \texttt{col = value}
+uses the GSI (\texttt{IN}, ranges and \texttt{FOR UPDATE} ask every shard).
+
+\textbf{Next steps:}
+\begin{enumerate}
+  \item \textbf{Benchmarks:} write throughput and latency with and without the GSI; lookup latency,
+        GSI vs every shard, at 2, 3 and 4 shards.
+  \item \textbf{Cost model:} selectivity-based cost, so the planner uses the GSI only when cheaper.
+  \item \textbf{Online index build} on a populated table under live writes (F1 states: write-only,
+        backfill, validate, ready).
+  \item \textbf{Asynchronous mode} via logical decoding, with lag measurement; no global uniqueness
+        in this mode.
+\end{enumerate}
+
+\end{document}

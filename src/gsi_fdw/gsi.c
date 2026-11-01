@@ -24,6 +24,7 @@
 #include "miscadmin.h"
 #include "nodes/makefuncs.h"
 #include "optimizer/appendinfo.h"
+#include "parser/parsetree.h"
 #include "partitioning/partbounds.h"
 #include "postgres_fdw.h"
 #include "gsi.h"
@@ -61,6 +62,8 @@ gsi_init(void)
 							   0,
 							   NULL, NULL, NULL);
 
+	gsi_resolver_init();
+	gsi_scan_init();
 	MarkGUCPrefixReserved("gsi");
 }
 
@@ -108,19 +111,21 @@ gsi_load_nodes(int *nnodes, MemoryContext cxt)
 }
 
 /*
- * Return the sync GSI on relid (a partitioned table or one of its
- * partitions), or NULL.  v1 supports one GSI per table.
+ * Return the sync GSIs on relid (a partitioned table or one of its
+ * partitions), ordered by index name, or NIL.
  */
-GsiIndex *
-gsi_index_for_rel(Oid relid)
+List *
+gsi_indexes_for_rel(Oid relid)
 {
 	MemoryContext cxt = CurrentMemoryContext;
-	GsiIndex   *idx = NULL;
+	List	   *indexes = NIL;
+	Oid		   *servers = NULL;
+	int			nnodes = 0;
 	Oid			argtypes[1] = {REGCLASSOID};
 	Datum		args[1];
 
 	if (!OidIsValid(get_namespace_oid("gsi", true)))
-		return NULL;
+		return NIL;
 	if (get_rel_relispartition(relid))
 		relid = get_partition_parent(relid, false);
 	args[0] = ObjectIdGetDatum(relid);
@@ -131,32 +136,42 @@ gsi_index_for_rel(Oid relid)
 							  "i.status = 'ready', a.atttypid, a.attcollation "
 							  "FROM gsi.gsi_index i JOIN pg_catalog.pg_attribute a "
 							  "ON a.attrelid = i.base_table AND a.attname = i.column_name "
-							  "WHERE i.base_table = $1 AND i.mode = 'sync'",
-							  1, argtypes, args, NULL, false, 1) != SPI_OK_SELECT)
+							  "WHERE i.base_table = $1 AND i.mode = 'sync' "
+							  "ORDER BY i.index_name",
+							  1, argtypes, args, NULL, false, 0) != SPI_OK_SELECT)
 		elog(ERROR, "could not read gsi.gsi_index");
 
 	if (SPI_processed > 0)
 	{
-		HeapTuple	tup = SPI_tuptable->vals[0];
-		TupleDesc	desc = SPI_tuptable->tupdesc;
-		bool		isnull;
-		MemoryContext oldcxt = MemoryContextSwitchTo(cxt);
+		SPITupleTable *tuptable = SPI_tuptable;
+		uint64		nrows = SPI_processed;
 
-		idx = palloc0(sizeof(GsiIndex));
-		idx->name = pstrdup(NameStr(*DatumGetName(SPI_getbinval(tup, desc, 1, &isnull))));
-		idx->column = pstrdup(NameStr(*DatumGetName(SPI_getbinval(tup, desc, 2, &isnull))));
-		idx->is_unique = DatumGetBool(SPI_getbinval(tup, desc, 3, &isnull));
-		idx->is_ready = DatumGetBool(SPI_getbinval(tup, desc, 4, &isnull));
-		idx->typid = DatumGetObjectId(SPI_getbinval(tup, desc, 5, &isnull));
-		idx->collid = DatumGetObjectId(SPI_getbinval(tup, desc, 6, &isnull));
-		idx->remote_table = psprintf("public.%s",
-									 quote_identifier(psprintf("gsi_%s", idx->name)));
-		MemoryContextSwitchTo(oldcxt);
-		idx->servers = gsi_load_nodes(&idx->nnodes, cxt);
+		servers = gsi_load_nodes(&nnodes, cxt);
+		for (uint64 r = 0; r < nrows; r++)
+		{
+			HeapTuple	tup = tuptable->vals[r];
+			TupleDesc	desc = tuptable->tupdesc;
+			bool		isnull;
+			MemoryContext oldcxt = MemoryContextSwitchTo(cxt);
+			GsiIndex   *idx = palloc0(sizeof(GsiIndex));
+
+			idx->name = pstrdup(NameStr(*DatumGetName(SPI_getbinval(tup, desc, 1, &isnull))));
+			idx->column = pstrdup(NameStr(*DatumGetName(SPI_getbinval(tup, desc, 2, &isnull))));
+			idx->is_unique = DatumGetBool(SPI_getbinval(tup, desc, 3, &isnull));
+			idx->is_ready = DatumGetBool(SPI_getbinval(tup, desc, 4, &isnull));
+			idx->typid = DatumGetObjectId(SPI_getbinval(tup, desc, 5, &isnull));
+			idx->collid = DatumGetObjectId(SPI_getbinval(tup, desc, 6, &isnull));
+			idx->remote_table = psprintf("public.%s",
+										 quote_identifier(psprintf("gsi_%s", idx->name)));
+			idx->servers = servers;
+			idx->nnodes = nnodes;
+			indexes = lappend(indexes, idx);
+			MemoryContextSwitchTo(oldcxt);
+		}
 	}
 	SPI_finish();
 
-	return idx;
+	return indexes;
 }
 
 /*
@@ -179,8 +194,8 @@ gsi_node_for_datum(Datum value, Oid typid, Oid collid, int nnodes)
 	return (int) (h % (uint64) nnodes);
 }
 
-static int
-server_node(GsiIndex *idx, Oid serverid)
+int
+gsi_server_node(GsiIndex *idx, Oid serverid)
 {
 	for (int i = 0; i < idx->nnodes; i++)
 		if (idx->servers[i] == serverid)
@@ -206,61 +221,124 @@ add_junk_column(PlannerInfo *root, Index rtindex, Relation rel,
 						 rtindex, junkname);
 }
 
-/* UPDATE/DELETE fetch the old key and id so the old entry can be removed. */
+/* Junk column holding one GSI's old key */
+static char *
+old_key_junk_name(GsiIndex *idx)
+{
+	return psprintf("gsi_old_key_%s", idx->name);
+}
+
+/*
+ * UPDATE/DELETE fetch the old key of every GSI and the old id, so the old
+ * entries can be removed.
+ */
 void
 gsi_add_update_targets(PlannerInfo *root, Index rtindex, Relation rel,
-					   GsiIndex *idx)
+					   List *indexes)
 {
-	add_junk_column(root, rtindex, rel, idx->column, "gsi_old_key");
+	ListCell   *lc;
+
+	foreach(lc, indexes)
+	{
+		GsiIndex   *idx = lfirst(lc);
+
+		add_junk_column(root, rtindex, rel, idx->column, old_key_junk_name(idx));
+	}
 	add_junk_column(root, rtindex, rel, "id", "gsi_old_id");
 }
 
-GsiModifyState *
+/*
+ * May postgres_fdw push this UPDATE/DELETE down as one remote statement?
+ * Only if it can't change an index entry: the table has no GSI, or it's an
+ * UPDATE that sets no indexed column and not id.  Otherwise the per-row
+ * path must run so the indexes are maintained.
+ */
+bool
+gsi_direct_modify_ok(PlannerInfo *root, Index rtindex, CmdType operation)
+{
+	Oid			relid = planner_rt_fetch(rtindex, root)->relid;
+	List	   *indexes = gsi_indexes_for_rel(relid);
+	List	   *tlist = NIL;
+	List	   *update_attrs = NIL;
+	ListCell   *lc;
+
+	if (indexes == NIL)
+		return true;
+	if (operation != CMD_UPDATE)
+		return false;
+	get_translated_update_targetlist(root, rtindex, &tlist, &update_attrs);
+	if (list_member_int(update_attrs, get_attnum(relid, "id")))
+		return false;
+	foreach(lc, indexes)
+	{
+		GsiIndex   *idx = lfirst(lc);
+
+		if (list_member_int(update_attrs, get_attnum(relid, idx->column)))
+			return false;
+	}
+	return true;
+}
+
+/* Write state for every GSI on rel, or NIL if it has none. */
+List *
 gsi_begin_modify(Relation rel, CmdType operation, Plan *subplan,
 				 List *target_attrs)
 {
 	Oid			relid = RelationGetRelid(rel);
-	GsiIndex   *idx = gsi_index_for_rel(relid);
-	GsiModifyState *gs;
-	Oid			typoutput;
-	bool		typisvarlena;
+	List	   *indexes = gsi_indexes_for_rel(relid);
+	List	   *states = NIL;
+	AttrNumber	id_attno = get_attnum(relid, "id");
+	AttrNumber	old_id_junk = InvalidAttrNumber;
+	ListCell   *lc;
 
-	if (idx == NULL)
-		return NULL;
-
-	gs = palloc0(sizeof(GsiModifyState));
-	gs->idx = idx;
-	gs->base_node = server_node(idx, GetForeignTable(relid)->serverid);
-	gs->key_attno = get_attnum(relid, idx->column);
-	gs->id_attno = get_attnum(relid, "id");
-	getTypeOutputInfo(idx->typid, &typoutput, &typisvarlena);
-	fmgr_info(typoutput, &gs->key_out);
+	if (indexes == NIL)
+		return NIL;
 
 	if (operation == CMD_UPDATE || operation == CMD_DELETE)
 	{
-		gs->old_key_junk = ExecFindJunkAttributeInTlist(subplan->targetlist,
-														"gsi_old_key");
-		gs->old_id_junk = ExecFindJunkAttributeInTlist(subplan->targetlist,
-													   "gsi_old_id");
-		if (!AttributeNumberIsValid(gs->old_key_junk) ||
-			!AttributeNumberIsValid(gs->old_id_junk))
-			elog(ERROR, "could not find GSI junk columns");
+		old_id_junk = ExecFindJunkAttributeInTlist(subplan->targetlist,
+												   "gsi_old_id");
+		if (!AttributeNumberIsValid(old_id_junk))
+			elog(ERROR, "could not find GSI junk column \"gsi_old_id\"");
 	}
-	if (operation == CMD_UPDATE)
-	{
-		gs->key_updated = list_member_int(target_attrs, gs->key_attno);
 
-		/* foreign partitions don't move rows, so a new id could land on the wrong shard */
-		if (list_member_int(target_attrs, gs->id_attno))
-			ereport(ERROR,
-					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-					 errmsg("cannot update column \"id\" of a table with a GSI")));
+	/* foreign partitions don't move rows, so a new id could land on the wrong shard */
+	if (operation == CMD_UPDATE && list_member_int(target_attrs, id_attno))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("cannot update column \"id\" of a table with a GSI")));
+
+	foreach(lc, indexes)
+	{
+		GsiIndex   *idx = lfirst(lc);
+		GsiModifyState *gs = palloc0(sizeof(GsiModifyState));
+		Oid			typoutput;
+		bool		typisvarlena;
+
+		gs->idx = idx;
+		gs->base_node = gsi_server_node(idx, GetForeignTable(relid)->serverid);
+		gs->key_attno = get_attnum(relid, idx->column);
+		gs->id_attno = id_attno;
+		gs->old_id_junk = old_id_junk;
+		getTypeOutputInfo(idx->typid, &typoutput, &typisvarlena);
+		fmgr_info(typoutput, &gs->key_out);
+
+		if (operation == CMD_UPDATE || operation == CMD_DELETE)
+		{
+			gs->old_key_junk = ExecFindJunkAttributeInTlist(subplan->targetlist,
+															old_key_junk_name(idx));
+			if (!AttributeNumberIsValid(gs->old_key_junk))
+				elog(ERROR, "could not find GSI junk column for \"%s\"", idx->name);
+		}
+		if (operation == CMD_UPDATE)
+			gs->key_updated = list_member_int(target_attrs, gs->key_attno);
+		states = lappend(states, gs);
 	}
 
 	/* The coordinator's commit record is the 2PC decision; make sure it exists */
 	(void) GetTopFullTransactionId();
 
-	return gs;
+	return states;
 }
 
 static char *
@@ -272,14 +350,14 @@ key_text(GsiModifyState *gs, Datum value, int *node)
 }
 
 /*
- * Record the index entries to delete/insert for one row.  Done before the
+ * Record one GSI's entries to delete/insert for one row.  Done before the
  * base write because RETURNING replaces the slot contents.  For UPDATE the
  * slot holds only assigned columns, so unassigned ones come from the junk
  * (old) values.
  */
-void
-gsi_capture_row(GsiModifyState *gs, CmdType operation,
-				TupleTableSlot *slot, TupleTableSlot *planSlot)
+static void
+capture_one(GsiModifyState *gs, CmdType operation,
+			TupleTableSlot *slot, TupleTableSlot *planSlot)
 {
 	Datum		d;
 	bool		isnull;
@@ -318,6 +396,17 @@ gsi_capture_row(GsiModifyState *gs, CmdType operation,
 	if (operation == CMD_UPDATE && gs->old_key && gs->new_key &&
 		strcmp(gs->old_key, gs->new_key) == 0)
 		gs->old_key = gs->new_key = NULL;
+}
+
+/* Record the entries to delete/insert in every GSI for one row. */
+void
+gsi_capture_row(List *states, CmdType operation,
+				TupleTableSlot *slot, TupleTableSlot *planSlot)
+{
+	ListCell   *lc;
+
+	foreach(lc, states)
+		capture_one(lfirst(lc), operation, slot, planSlot);
 }
 
 /* Run one index statement on the node's connection, inside its remote xact. */
@@ -365,14 +454,21 @@ send_index_op(GsiModifyState *gs, int node, const char *key, int64 id,
 	PQclear(res);
 }
 
-/* Apply the captured entries after the base write succeeded. */
+/* Apply the captured entries of every GSI after the base write succeeded. */
 void
-gsi_apply_row(GsiModifyState *gs)
+gsi_apply_row(List *states)
 {
-	if (gs->old_key)
-		send_index_op(gs, gs->old_node, gs->old_key, gs->old_id, false);
-	if (gs->new_key)
-		send_index_op(gs, gs->new_node, gs->new_key, gs->new_id, true);
+	ListCell   *lc;
+
+	foreach(lc, states)
+	{
+		GsiModifyState *gs = lfirst(lc);
+
+		if (gs->old_key)
+			send_index_op(gs, gs->old_node, gs->old_key, gs->old_id, false);
+		if (gs->new_key)
+			send_index_op(gs, gs->new_node, gs->new_key, gs->new_id, true);
+	}
 }
 
 /* Run a DDL command on every node, as part of the distributed transaction. */
@@ -390,10 +486,27 @@ exec_on_all_nodes(GsiIndex *idx, const char *sql)
 	}
 }
 
+/* The GSI on column col, or NULL */
+static GsiIndex *
+index_on_column(List *indexes, const char *col)
+{
+	ListCell   *lc;
+
+	foreach(lc, indexes)
+	{
+		GsiIndex   *idx = lfirst(lc);
+
+		if (strcmp(idx->column, col) == 0)
+			return idx;
+	}
+	return NULL;
+}
+
 /*
  * gsi_create(base regclass, col name, is_unique bool) returns text
  *
- * v1 builds the index only on an empty table (no backfill).
+ * A table can have one GSI per column.  v1 builds the index only on an
+ * empty table (no backfill).
  */
 Datum
 gsi_create(PG_FUNCTION_ARGS)
@@ -424,11 +537,11 @@ gsi_create(PG_FUNCTION_ARGS)
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				 errmsg("GSI tables need a bigint column \"id\"")));
-	if (gsi_index_for_rel(base) != NULL)
+	if (index_on_column(gsi_indexes_for_rel(base), col) != NULL)
 		ereport(ERROR,
 				(errcode(ERRCODE_DUPLICATE_OBJECT),
-				 errmsg("table \"%s\" already has a GSI",
-						RelationGetRelationName(rel))));
+				 errmsg("column \"%s\" of table \"%s\" already has a GSI",
+						col, RelationGetRelationName(rel))));
 
 	relname = quote_qualified_identifier(get_namespace_name(RelationGetNamespace(rel)),
 										 RelationGetRelationName(rel));
@@ -453,7 +566,7 @@ gsi_create(PG_FUNCTION_ARGS)
 		elog(ERROR, "could not insert into gsi.gsi_index");
 	SPI_finish();
 
-	idx = gsi_index_for_rel(base);
+	idx = index_on_column(gsi_indexes_for_rel(base), col);
 	exec_on_all_nodes(idx,
 					  psprintf("CREATE TABLE %s (key %s NOT NULL, id bigint NOT NULL, "
 							   "shard int NOT NULL, PRIMARY KEY (key, id))",
@@ -467,31 +580,59 @@ gsi_create(PG_FUNCTION_ARGS)
 	PG_RETURN_TEXT_P(cstring_to_text(name));
 }
 
-/* gsi_drop(base regclass) */
+/*
+ * gsi_drop(base regclass, col name DEFAULT NULL)
+ *
+ * Drops the GSI on col, or every GSI of the table when col is NULL.
+ */
 Datum
 gsi_drop(PG_FUNCTION_ARGS)
 {
-	Oid			base = PG_GETARG_OID(0);
-	GsiIndex   *idx;
-	Oid			argtypes[1] = {REGCLASSOID};
-	Datum		args[1];
+	Oid			base;
+	List	   *indexes;
+	Oid			argtypes[1] = {NAMEOID};
 	Relation	rel;
+	ListCell   *lc;
+
+	if (PG_ARGISNULL(0))
+		ereport(ERROR,
+				(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
+				 errmsg("table must not be NULL")));
+	base = PG_GETARG_OID(0);
 
 	rel = table_open(base, AccessExclusiveLock);
-	idx = gsi_index_for_rel(base);
-	if (idx == NULL)
+	indexes = gsi_indexes_for_rel(base);
+	if (!PG_ARGISNULL(1))
+	{
+		char	   *col = NameStr(*PG_GETARG_NAME(1));
+		GsiIndex   *idx = index_on_column(indexes, col);
+
+		if (idx == NULL)
+			ereport(ERROR,
+					(errcode(ERRCODE_UNDEFINED_OBJECT),
+					 errmsg("column \"%s\" of table \"%s\" has no GSI",
+							col, RelationGetRelationName(rel))));
+		indexes = list_make1(idx);
+	}
+	else if (indexes == NIL)
 		ereport(ERROR,
 				(errcode(ERRCODE_UNDEFINED_OBJECT),
 				 errmsg("table \"%s\" has no GSI", RelationGetRelationName(rel))));
 
-	args[0] = ObjectIdGetDatum(base);
-	SPI_connect();
-	if (SPI_execute_with_args("DELETE FROM gsi.gsi_index WHERE base_table = $1",
-							  1, argtypes, args, NULL, false, 0) != SPI_OK_DELETE)
-		elog(ERROR, "could not delete from gsi.gsi_index");
-	SPI_finish();
+	foreach(lc, indexes)
+	{
+		GsiIndex   *idx = lfirst(lc);
+		Datum		args[1];
 
-	exec_on_all_nodes(idx, psprintf("DROP TABLE IF EXISTS %s", idx->remote_table));
+		args[0] = DirectFunctionCall1(namein, CStringGetDatum(idx->name));
+		SPI_connect();
+		if (SPI_execute_with_args("DELETE FROM gsi.gsi_index WHERE index_name = $1",
+								  1, argtypes, args, NULL, false, 0) != SPI_OK_DELETE)
+			elog(ERROR, "could not delete from gsi.gsi_index");
+		SPI_finish();
+
+		exec_on_all_nodes(idx, psprintf("DROP TABLE IF EXISTS %s", idx->remote_table));
+	}
 
 	table_close(rel, NoLock);
 	PG_RETURN_VOID();
