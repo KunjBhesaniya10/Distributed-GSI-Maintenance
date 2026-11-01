@@ -32,6 +32,7 @@
 #include "postgres_fdw.h"
 #include "gsi.h"
 #include "utils/builtins.h"
+#include "utils/guc.h"
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
 #include "utils/typcache.h"
@@ -57,6 +58,9 @@ typedef struct GsiScanState
 } GsiScanState;
 
 static set_rel_pathlist_hook_type prev_set_rel_pathlist_hook = NULL;
+
+/* gsi.enable_lookup: like enable_indexscan, for comparing against broadcast */
+static bool gsi_enable_lookup = true;
 
 static Plan *gsi_plan_path(PlannerInfo *root, RelOptInfo *rel,
 						   CustomPath *best_path, List *tlist,
@@ -148,7 +152,8 @@ gsi_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, Index rti,
 		prev_set_rel_pathlist_hook(root, rel, rti, rte);
 
 	/* SELECT on a partitioned table, not a write target, no row locks */
-	if (rte->rtekind != RTE_RELATION || rte->relkind != RELKIND_PARTITIONED_TABLE ||
+	if (!gsi_enable_lookup ||
+		rte->rtekind != RTE_RELATION || rte->relkind != RELKIND_PARTITIONED_TABLE ||
 		rel->reloptkind != RELOPT_BASEREL || IS_DUMMY_REL(rel) ||
 		root->parse->resultRelation == rti || root->parse->rowMarks != NIL)
 		return;
@@ -475,6 +480,14 @@ gsi_explain_scan(CustomScanState *node, List *ancestors, ExplainState *es)
 void
 gsi_scan_init(void)
 {
+	DefineCustomBoolVariable("gsi.enable_lookup",
+							 "Lets the planner use GsiLookup for indexed-column lookups.",
+							 NULL,
+							 &gsi_enable_lookup,
+							 true,
+							 PGC_USERSET,
+							 0,
+							 NULL, NULL, NULL);
 	RegisterCustomScanMethods(&gsi_scan_methods);
 	prev_set_rel_pathlist_hook = set_rel_pathlist_hook;
 	set_rel_pathlist_hook = gsi_set_rel_pathlist;

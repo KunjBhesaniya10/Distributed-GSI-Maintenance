@@ -26,7 +26,7 @@ Core PostgreSQL has no global indexes, and Citus has only shard-local ones.
 
 | Core (must work) | Stretch (only after core) |
 |---|---|
-| Docker cluster: 1 coordinator + 3 data nodes | Async maintenance via logical decoding |
+| Docker cluster: 1 coordinator + 5 data nodes | Async maintenance via logical decoding |
 | Sync maintenance with 2PC + crash resolver + global uniqueness | Online index build (F1 states) |
 | Read routing via planner hook + CustomScan | |
 | Consistency checker, fault injection, benchmarks | |

@@ -1,4 +1,4 @@
-# 1 coordinator + 3 data nodes; each data node holds one base partition
+# 1 coordinator + 5 data nodes; each data node holds one base partition
 # and one index partition.
 x-node: &node
   image: gsi-pg:16
@@ -10,23 +10,30 @@ x-node: &node
     interval: 2s
     retries: 30
 
+x-shard: &shard
+  <<: *node
+  command: postgres -c max_prepared_transactions=100
+  volumes: ["./init/datanode.sql:/docker-entrypoint-initdb.d/init.sql:ro"]
+
 services:
   shard1:
-    <<: *node
-    command: postgres -c max_prepared_transactions=100
+    <<: *shard
     ports: ["5433:5432"]
-    volumes: ["./init/datanode.sql:/docker-entrypoint-initdb.d/init.sql:ro"]
   shard2:
-    <<: *node
-    command: postgres -c max_prepared_transactions=100
+    <<: *shard
     ports: ["5434:5432"]
-    volumes: ["./init/datanode.sql:/docker-entrypoint-initdb.d/init.sql:ro"]
     depends_on: [shard1]
   shard3:
-    <<: *node
-    command: postgres -c max_prepared_transactions=100
+    <<: *shard
     ports: ["5435:5432"]
-    volumes: ["./init/datanode.sql:/docker-entrypoint-initdb.d/init.sql:ro"]
+    depends_on: [shard1]
+  shard4:
+    <<: *shard
+    ports: ["5436:5432"]
+    depends_on: [shard1]
+  shard5:
+    <<: *shard
+    ports: ["5437:5432"]
     depends_on: [shard1]
   coordinator:
     <<: *node
@@ -40,3 +47,5 @@ services:
       shard1: { condition: service_healthy }
       shard2: { condition: service_healthy }
       shard3: { condition: service_healthy }
+      shard4: { condition: service_healthy }
+      shard5: { condition: service_healthy }

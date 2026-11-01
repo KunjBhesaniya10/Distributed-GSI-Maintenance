@@ -44,10 +44,10 @@ cd C:\Users\Kunj\Desktop\cs631\Distributed-GSI-Maintenance\docker
 
 ```
 docker compose down -v                # wipe any old cluster (init SQL only runs on empty volumes)
-docker compose up -d --build          # builds the image (compiles gsi_fdw), starts 4 nodes
+docker compose up -d --build          # builds the image (compiles gsi_fdw), starts 6 containers
 docker compose ps
 ```
-**Expect:** four containers, `coordinator`, `shard1`, `shard2`, `shard3`, all `(healthy)`. The build prints gcc lines with no `warning:`.
+**Expect:** six containers, `coordinator` and `shard1` ... `shard5`, all `(healthy)`. The build prints gcc lines with no `warning:`.
 
 Optional, to see the compile: `docker compose build --no-cache --progress=plain 2>&1 | findstr gcc` (PowerShell) or `| grep gcc` (bash).
 
@@ -214,7 +214,7 @@ SELECT * FROM users WHERE email = 'alice@x';
 
 ### Compare with the broadcast plan
 ```sql
-EXPLAIN SELECT * FROM users WHERE name = 'Alice';           -- not indexed: Append over all 3 shards
+EXPLAIN SELECT * FROM users WHERE name = 'Alice';           -- not indexed: Append over all 5 shards
 EXPLAIN SELECT * FROM users WHERE email || '' = 'alice@x';  -- expression: also broadcast
 ```
 

@@ -28,7 +28,7 @@ INSERT INTO users VALUES
     (7, 'sybil@x', 'Sybil'),
     (8, 'heidi@x', 'Heidi');
 
--- where each row lives: users_pN is on node N (0 = shard1, 1 = shard2, 2 = shard3)
+-- where each row lives: users_pN is on node N (0 = shard1, 1 = shard2, ..., 4 = shard5)
 SELECT id, email, tableoid::regclass AS base_partition, gsi_node_for(email) AS index_node
 FROM users ORDER BY id;
 
@@ -40,6 +40,12 @@ SELECT pg_reload_conf();
 ALTER SYSTEM SET log_statement = 'all';
 SELECT pg_reload_conf();
 \connect postgres postgres shard3 5432
+ALTER SYSTEM SET log_statement = 'all';
+SELECT pg_reload_conf();
+\connect postgres postgres shard4 5432
+ALTER SYSTEM SET log_statement = 'all';
+SELECT pg_reload_conf();
+\connect postgres postgres shard5 5432
 ALTER SYSTEM SET log_statement = 'all';
 SELECT pg_reload_conf();
 
@@ -61,7 +67,7 @@ UPDATE users SET name = 'Rob' WHERE id = 3;                      -- non-key chan
 DELETE FROM users WHERE id = 1;                                  -- row and entry removed
 SELECT id, email, tableoid::regclass, gsi_node_for(email) FROM users ORDER BY id;
 --   these two tables exist only on the shards, not the coordinator:
---   switch with \c postgres postgres shard1 5432  (shard2, shard3; back: \c postgres postgres localhost 5432)
+--   switch with \c postgres postgres shard1 5432  (shard2 ... shard5; back: \c postgres postgres localhost 5432)
 SELECT * FROM users_shard;
 SELECT * FROM gsi_users_email;                                   -- (key, id, shard of the base row)
 
@@ -69,7 +75,7 @@ SELECT * FROM gsi_users_email;                                   -- (key, id, sh
 --   on the coordinator:
 INSERT INTO users VALUES (9, 'zoe@x', 'Zoe');
 --   in a shell (docker/ folder):
---   docker compose logs --since 1m shard1 shard2 shard3 | grep -E "PREPARE TRANSACTION|COMMIT PREPARED"
+--   docker compose logs --since 1m shard1 shard2 shard3 shard4 shard5 | grep -E "PREPARE TRANSACTION|COMMIT PREPARED"
 --   -> PREPARE TRANSACTION 'gsi_<xid>_shardN_i|b' on each participant,
 --      then COMMIT PREPARED on the _i participants before the _b ones.
 INSERT INTO users VALUES (10, 'alice@x', 'Fake');                -- duplicate: whole txn rolls back

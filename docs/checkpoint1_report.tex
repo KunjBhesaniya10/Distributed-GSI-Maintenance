@@ -50,7 +50,7 @@ Online index build, async mode           & Stretch    & After checkpoint \\
 All our code is one PostgreSQL C extension, \texttt{gsi\_fdw}: a modified copy of
 \texttt{postgres\_fdw} (PostgreSQL's wrapper for remote servers) plus about 1,500 lines of our own code.
 \begin{itemize}
-  \item \textbf{Cluster:} Docker Compose, 1 coordinator and 3 data nodes (PostgreSQL 16). On the
+  \item \textbf{Cluster:} Docker Compose, 1 coordinator and 5 data nodes (PostgreSQL 16). On the
         coordinator, \texttt{users} is hash-partitioned by \texttt{id}; each partition is a foreign
         table on one data node, so PostgreSQL's partition routing sends each row to its shard.
   \item \textbf{Connections:} we reuse postgres\_fdw's connection cache and per-node remote

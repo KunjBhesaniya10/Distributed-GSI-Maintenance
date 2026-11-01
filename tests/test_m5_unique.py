@@ -5,7 +5,7 @@ import psycopg2
 import pytest
 
 from checker import assert_consistent
-from conftest import COORD, connect, q
+from conftest import COORD, NNODES, connect, q
 
 
 def base_node(shards, i):
@@ -15,8 +15,8 @@ def base_node(shards, i):
 def test_duplicate_rejected_across_shards(ugsi, shards):
     q(ugsi, "INSERT INTO users VALUES (1, 'a@x', 'a')")
     other = next(i for i in range(2, 50)
-                 if q(ugsi, "SELECT NOT satisfies_hash_partition('users'::regclass, 3, %s, %s::bigint)",
-                      (base_node(shards, 1), i))[0][0])
+                 if q(ugsi, "SELECT NOT satisfies_hash_partition('users'::regclass, %s, %s, %s::bigint)",
+                      (NNODES, base_node(shards, 1), i))[0][0])
     with pytest.raises(psycopg2.errors.UniqueViolation):
         q(ugsi, "INSERT INTO users VALUES (%s, 'a@x', 'b')", (other,))
     assert assert_consistent(ugsi, shards) == 1        # nothing left of the failed insert

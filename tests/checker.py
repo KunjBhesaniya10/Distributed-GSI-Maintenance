@@ -23,10 +23,13 @@ def check(coord, shards, index_table="gsi_users_email", column="email"):
     for node, s in enumerate(shards):
         base |= {(k, i, node) for i, k in q(s, f"SELECT id, {column}::text FROM users_shard "
                                                f"WHERE {column} IS NOT NULL")}
-        for key, i, shard in q(s, f"SELECT key::text, id, shard FROM {index_table}"):
-            index.add((key, i, shard))
-            if q(coord, f"SELECT gsi_node_for(%s::text::{type_of(coord, column)})", (key,))[0][0] != node:
-                misplaced.append((key, i, node))
+        entries = q(s, f"SELECT key::text, id, shard FROM {index_table}")
+        index |= set(entries)
+        # placement of every entry on this node, in one round trip
+        wrong = q(coord, f"SELECT k FROM unnest(%s::text[]) k "
+                         f"WHERE gsi_node_for(k::{type_of(coord, column)}) <> %s",
+                  ([k for k, _, _ in entries], node))
+        misplaced += [(k, node) for (k,) in wrong]
         leftover += [g for (g,) in q(s, "SELECT gid FROM pg_prepared_xacts "
                                         "WHERE gid LIKE 'gsi\\_%'")]
     return {

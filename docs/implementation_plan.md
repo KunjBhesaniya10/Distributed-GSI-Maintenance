@@ -111,7 +111,7 @@ src/gsi_fdw/                 copy of contrib/postgres_fdw @ REL_16_STABLE, then 
   gsi_admin.c                gsi_create / gsi_drop (§7)
 src/gsi_decoder/             stretch: logical decoding plugin
 tests/
-  conftest.py                psycopg fixtures for the 4 nodes
+  conftest.py                psycopg fixtures for the coordinator + NNODES data nodes
   test_*.py                  pytest, one file per milestone
   checker.py                 consistency checker (§9.1)
 benchmarks/                  pgbench scripts + runner
@@ -578,7 +578,7 @@ Each milestone is done when its tests pass and the checker is clean. Do them in 
 | **M6** | `gsi_resolve()` SQL function + fail points | M4 | `test_m6` passes with a manual resolve |
 | **M7** | Resolver background worker | M6 | `test_m6` passes without a manual call |
 | **M8** | Planner hook + GsiLookup CustomScan | M3 | `test_m8` passes |
-| **M9** | Stress test + benchmarks (write: no index vs sync; read: GSI vs broadcast at 2/3/4 nodes) | M7, M8 | results and plots in `benchmarks/results/` |
+| **M9** | Stress test + benchmarks (write: no index vs sync; read: GSI vs broadcast at 2..5 nodes) | M7, M8 | results and plots in `benchmarks/results/` |
 | S1 | Async mode | M9 | checker is clean once the lag drains |
 | S2 | Online build | M9 | building on a populated table under the stress workload ends clean |
 

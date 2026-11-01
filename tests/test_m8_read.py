@@ -1,7 +1,7 @@
 """M8: point lookups on the indexed column go through the GSI (two hops)."""
 import random
 
-from conftest import COORD, connect, q
+from conftest import COORD, NNODES, connect, q
 
 
 def plan(c, sql, args=None, analyze=False):
@@ -25,6 +25,15 @@ def test_plan_uses_gsi(gsi):
     assert "GSI: users_email" in p
 
 
+def test_enable_lookup_off_broadcasts(gsi):
+    q(gsi, "SET gsi.enable_lookup = off")
+    try:
+        p = plan(gsi, "SELECT * FROM users WHERE email = 'a@x'")
+        assert "GsiLookup" not in p and "Append" in p
+    finally:
+        q(gsi, "RESET gsi.enable_lookup")
+
+
 def test_plan_without_key_qual_broadcasts(gsi):
     p = plan(gsi, "SELECT * FROM users WHERE name = 'a'")
     assert "GsiLookup" not in p and "Append" in p
@@ -45,7 +54,7 @@ def test_unique_key_touches_one_shard(ugsi):
 def test_non_unique_key_spans_shards(gsi):
     q(gsi, "INSERT INTO users SELECT g, 'same@x', 'n' FROM generate_series(1, 30) g")
     assert q(gsi, "SELECT count(*) FROM users WHERE email = 'same@x'") == [(30,)]
-    assert "Shards Fetched: 3" in plan(gsi, "SELECT * FROM users WHERE email = 'same@x'", analyze=True)
+    assert f"Shards Fetched: {NNODES}" in plan(gsi, "SELECT * FROM users WHERE email = 'same@x'", analyze=True)
 
 
 def test_extra_quals_and_projection(gsi):

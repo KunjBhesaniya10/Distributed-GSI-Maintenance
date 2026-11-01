@@ -10,15 +10,15 @@ import psycopg2
 import pytest
 
 from checker import assert_consistent
-from conftest import COORD, connect, q
+from conftest import COORD, NNODES, connect, q
 
 
 def pick_row(c):
     """An (id, email, base_node, index_node) with base_node != index_node."""
     for i in range(1, 100):
-        base = next(r for r in range(3)
-                    if q(c, "SELECT satisfies_hash_partition('users'::regclass, 3, %s, %s::bigint)",
-                         (r, i))[0][0])
+        base = next(r for r in range(NNODES)
+                    if q(c, "SELECT satisfies_hash_partition('users'::regclass, %s, %s, %s::bigint)",
+                         (NNODES, r, i))[0][0])
         key = f"crash{i}@x"
         node = q(c, "SELECT gsi_node_for(%s::text)", (key,))[0][0]
         if node != base:

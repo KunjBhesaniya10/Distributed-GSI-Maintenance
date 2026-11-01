@@ -199,7 +199,7 @@ Docker Desktop running, plus Python 3 with `psycopg2` and `pytest`.
 ### 4.2 Commands
 ```bash
 cd docker
-docker compose up -d --build          # build image (compiles gsi_fdw), start 4 nodes
+docker compose up -d --build          # build image (compiles gsi_fdw), start 6 containers (coordinator + 5 data nodes)
 docker compose ps                     # all four "healthy"
 
 cd ../tests
@@ -227,7 +227,7 @@ docker compose up -d --build
 │        ├── gcc *.c → *.o → gsi_fdw.so        → $libdir
 │        └── gsi_fdw.control, gsi_fdw--1.0.sql → share/extension/
 │
-├── start shard1, shard2, shard3        (postgres -c max_prepared_transactions=100)
+├── start shard1 ... shard5             (postgres -c max_prepared_transactions=100)
 │   └── first start: initdb, then docker/init/datanode.sql
 │        └── CREATE TABLE users_shard (id bigint PRIMARY KEY, email text, name text)
 │

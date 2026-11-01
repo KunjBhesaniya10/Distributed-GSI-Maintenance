@@ -22,7 +22,7 @@ When a table is sharded across PostgreSQL servers by primary key, a query on ano
 ## Scope (agreed priorities)
 
 **Core deliverable (must work):**
-1. Cluster: Docker Compose with 1 coordinator and 3 data nodes, `max_prepared_transactions > 0` everywhere.
+1. Cluster: Docker Compose with 1 coordinator and 5 data nodes (was 3 until 2026-11-01), `max_prepared_transactions > 0` everywhere.
 2. Synchronous GSI maintenance with two-phase commit, the crash resolver, and global uniqueness.
 3. Query routing through the planner (CustomScan).
 4. Evaluation: benchmarks, consistency checker, fault injection.

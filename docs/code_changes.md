@@ -158,7 +158,7 @@ New functions in that section:
 ---
 
 ## 3. Outside `src/`
-- [docker/](../docker/): image that builds the extension; 4-node compose; init SQL.
+- [docker/](../docker/): image that builds the extension; 6-container compose (coordinator + 5 data nodes); init SQL.
 - [tests/](../tests/): pytest per milestone plus [checker.py](../tests/checker.py).
 
 *Line ranges are a snapshot. Regenerate them with `diff -U0 <upstream>/connection.c src/gsi_fdw/connection.c` after edits.*

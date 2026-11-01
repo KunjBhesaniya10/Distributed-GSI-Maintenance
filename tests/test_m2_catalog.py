@@ -2,7 +2,7 @@
 import psycopg2
 import pytest
 
-from conftest import q
+from conftest import NNODES, q
 
 
 def test_index_tables_created(gsi, shards):
@@ -20,8 +20,8 @@ def test_unique_index_created(ugsi, shards):
 
 def test_placement_spreads_keys(gsi):
     nodes = [n for (n,) in q(gsi, "SELECT gsi_node_for('k' || g) FROM generate_series(1, 300) g")]
-    counts = [nodes.count(i) for i in range(3)]
-    assert all(c > 50 for c in counts), counts
+    counts = [nodes.count(i) for i in range(NNODES)]
+    assert all(c > 300 / NNODES / 2 for c in counts), counts
 
 
 def test_create_requires_empty_table(gsi):

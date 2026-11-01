@@ -25,6 +25,7 @@ This is the record we show the professor at each checkpoint: what was built, how
 | M8 planner hook + GsiLookup | done | `test_m8_read.py` (12), EXPLAIN output | 2026-10-29 |
 | M9 stress + benchmarks | stress done, quick lookup timing done, full benchmarks not started | `test_stress.py` (2) | 2026-10-29 |
 | Per-statement pushdown; several GSIs per table | done | `test_m3_write.py` (+4), `test_multi_gsi.py` (9) | 2026-11-01 |
+| 5 data nodes, 1M-row load, first lookup benchmark | done | full suite on 5 nodes (65), `bench/` | 2026-11-01 |
 | S1 async mode | not started | | |
 | S2 online build | not started | | |
 
@@ -169,4 +170,30 @@ This is the record we show the professor at each checkpoint: what was built, how
 2. `gsi.gsi_node` must not change while GSIs exist (placement is `hash mod N`, no rebalancing); nothing enforces this.
 3. `id` must be globally unique (the table partitioned by `id`); `gsi_create` doesn't check the partition key.
 4. Primary key `id bigint`; index tables in schema `public`; one coordinator; no catalog cache; one level of partitioning, every partition a gsi_fdw foreign table (checked only at first use).
+
+### 5 data nodes, 1M rows, first lookup benchmark (2026-11-01)
+
+**What changed:**
+- Cluster: 1 coordinator + **5 data nodes** (`docker-compose.yml`, `init/coordinator.sql`: `MODULUS 5`, nodes 0-4). Tests read the node count from `conftest.NNODES` instead of assuming 3 (fixed hard-coded `3` in test_m2, m4, m5, m6, m8; test_m5 had passed by luck with the wrong modulus).
+- New GUC `gsi.enable_lookup` (default on, `PGC_USERSET`), like `enable_indexscan`: `off` makes the planner use the normal Append over all shards. Used for a same-query GSI vs broadcast comparison. Test: `test_enable_lookup_off_broadcasts`.
+- `bench/load_users.sh`: loads N rows through the real write path with parallel sessions (GSIs on `email` unique and `name` non-unique). `bench/run_lookups.sh` + `lookup_email.sql` / `lookup_name.sql`: pgbench GSI vs broadcast. `bench/README.md`: data, commands, M9 plan.
+- `checker.py`: placement check is one query per node (was one per entry), so it scales to 1M rows.
+
+**How it was verified:**
+- fresh 5-node cluster: `python -m pytest -q .` -> **65 passed in 95.3s**; `python checker.py` -> `users_email: rows=97 missing=0 orphaned=0 misplaced=0 prepared=0`
+- `bash bench/load_users.sh 1000000 8` -> `loaded in 81s (12345 rows/s)` (3M remote writes under 2PC); partitions 199,134 / 200,642 / 199,715 / 200,325 / 200,184 rows; 1,600 distinct names
+- `python tests/checker.py` on 1M rows -> `users_email: rows=1000000 missing=0 orphaned=0 misplaced=0 prepared=0`, `users_name: rows=1000000 missing=0 orphaned=0 misplaced=0 prepared=0` (1m48s)
+- EXPLAIN ANALYZE: email lookup `GSI: users_email`, `Shards Fetched: 1`, rows=1; name lookup `GSI: users_name`, `Shards Fetched: 5`, rows=625; with `gsi.enable_lookup = off`: Append over 5 foreign scans
+- `bash bench/run_lookups.sh 15 4` (pgbench, 4 clients, 15 s each, one laptop, 16 CPUs):
+
+| Query | Shards | GSI | Broadcast |
+|---|---|---|---|
+| `email = ?` (unique) | no local index | 1.558 ms, 2,568 tps | 57.506 ms, 70 tps |
+| `name = ?` (~625 rows) | no local index | 6.334 ms, 631 tps | 60.294 ms, 66 tps |
+| `email = ?` (unique) | local index per shard (`LOCAL_INDEX=1`) | 1.464 ms, 2,733 tps | 3.245 ms, 1,232 tps |
+| `name = ?` (~625 rows) | local index per shard | 6.614 ms, 605 tps | **5.228 ms, 765 tps** |
+
+**Reading:** for a selective key the GSI wins even against per-shard indexes (2 round trips instead of 5). For a key whose rows sit on every shard, the GSI still contacts all 5 shards plus the index node, so broadcast with local indexes is faster. This is the case the planned selectivity-based cost model must detect (today's fixed 0.1x cost always picks the GSI).
+
+**Known issues:** single-laptop numbers (all containers share one machine; no network latency between nodes); write-cost and node-count sweeps not run yet.
 

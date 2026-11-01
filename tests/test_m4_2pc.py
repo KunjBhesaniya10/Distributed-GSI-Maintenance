@@ -3,7 +3,7 @@ import psycopg2
 import pytest
 
 from checker import assert_consistent
-from conftest import COORD, connect, q
+from conftest import COORD, NNODES, connect, q
 
 
 def test_commit_leaves_no_prepared(gsi, shards):
@@ -42,7 +42,7 @@ def test_failed_prepare_aborts_all(gsi, shards):
         c = connect(COORD, autocommit=False)
         q(c, "INSERT INTO users SELECT g, 'u' || g || '@x', 'n' FROM generate_series(1, 30) g")
         q(c, "INSERT INTO users SELECT min(g), 'boom@x', 'n' FROM generate_series(1000, 1100) g "
-             "WHERE satisfies_hash_partition('users'::regclass, 3, 0, g::bigint)")
+             "WHERE satisfies_hash_partition('users'::regclass, %s, 0, g::bigint)", (NNODES,))
         with pytest.raises(psycopg2.errors.UniqueViolation):
             c.commit()
         assert assert_consistent(gsi, shards) == 0

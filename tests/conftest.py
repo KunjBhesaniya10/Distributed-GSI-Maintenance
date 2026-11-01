@@ -5,7 +5,8 @@ import psycopg2
 import pytest
 
 COORD = dict(host="localhost", port=5432, user="postgres", dbname="postgres")
-SHARDS = [dict(COORD, port=p) for p in (5433, 5434, 5435)]
+NNODES = 5                                   # data nodes in docker-compose.yml
+SHARDS = [dict(COORD, port=5433 + i) for i in range(NNODES)]
 
 
 def connect(params, autocommit=True):
