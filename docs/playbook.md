@@ -6,6 +6,73 @@ Commands work in **PowerShell** and **Git Bash**. Run everything from the `docke
 
 ---
 
+## New laptop: verify, test, load 1M rows, benchmark (~7 min)
+
+Run from the repo root in **Git Bash** (the `bench/` scripts are bash). The cluster is 1 coordinator + 5 data nodes.
+
+**0. Start the cluster** (first time on this laptop, or after the node count changed):
+```
+git pull
+cd docker
+docker compose down -v                 # wipes old volumes, e.g. from the old 3-node setup
+docker compose up -d --build
+```
+
+**1. Check the cluster** (from `docker/`):
+```
+docker compose ps
+docker compose exec -T coordinator psql -U postgres -c "SELECT * FROM gsi.gsi_node"
+```
+Expect 6 containers, all `(healthy)`, and **5 rows** (`shard1` … `shard5`). Only 3 rows means old volumes: `docker compose down -v`, then `docker compose up -d --build`.
+
+**2. Test suite** (~1.5 min). Proves the build works on this laptop:
+```
+pip install psycopg2-binary pytest      # once per laptop
+cd tests
+python -m pytest -q .
+python checker.py
+```
+Expect `65 passed` and `users_email: rows=... missing=0 orphaned=0 misplaced=0 prepared=0`.
+
+**3. Demo data: 1M rows** (~80 s). Run it **after** the tests, because they truncate `users`:
+```
+cd ..
+bash bench/load_users.sh
+python tests/checker.py
+```
+Expect `loaded in ~80s` (slower on a weaker laptop), then `users_email` and `users_name` both with `rows=1000000` and all zeros (the checker takes ~2 min).
+
+**4. Benchmark: GSI vs broadcast** (~2 min each):
+```
+bash bench/run_lookups.sh 15 4                  # shards without a local index
+LOCAL_INDEX=1 bash bench/run_lookups.sh 15 4    # each shard has its own index (fair baseline)
+```
+Reference on a 16-CPU laptop: unique email GSI ~1.5 ms vs broadcast ~57 ms (no shard index) and ~3.2 ms (with shard indexes). Details and the full table: [progress.md](progress.md), [bench/README.md](../bench/README.md).
+
+**5. Demo by hand:** `docker compose exec coordinator psql -U postgres` (from `docker/`), then:
+```sql
+EXPLAIN ANALYZE SELECT * FROM users WHERE email = 'user123456@mail.org';   -- GsiLookup, Shards Fetched: 1
+EXPLAIN ANALYZE SELECT * FROM users WHERE name = 'Priya Shah';            -- GSI users_name, Shards Fetched: 5
+SET gsi.enable_lookup = off;
+EXPLAIN ANALYZE SELECT * FROM users WHERE email = 'user123456@mail.org';   -- Append over 5 shards, slower
+```
+Crash recovery demo: §8 below.
+
+**If a script fails** with `$'\r': command not found` (Windows line endings), run `sed -i 's/\r$//' bench/*.sh docker/*.sh` once from the repo root.
+
+### When to run `docker compose` again
+
+| Situation | Command (from `docker/`) | Data kept? |
+|---|---|---|
+| Normal use: psql, tests, benchmarks | nothing | yes |
+| After a reboot or quitting Docker Desktop | `docker compose up -d` | yes |
+| After changing C code in `src/gsi_fdw` | `docker compose up -d --build` | yes (rebuilds the image, same volumes) |
+| After changing `docker-compose.yml` or `docker/init/*.sql`, or to start clean | `docker compose down -v` then `docker compose up -d --build` | **no**, wiped |
+
+The init scripts run only on an empty data volume, which is why a topology change needs `down -v`. `pytest` truncates `users`; rerun `bash bench/load_users.sh` to get the 1M rows back.
+
+---
+
 ## Quick run (everything in one go)
 
 [docker/playbook.sql](../docker/playbook.sql) does the setup: it (re)creates the unique GSI on `users.email`, loads 8 sample rows, prints where each row and index entry lives, and turns on statement logging on the shards (to see the 2PC commands). Example queries for live testing (read path, UPDATE/DELETE, 2PC) are in a comment at the end of the file.
