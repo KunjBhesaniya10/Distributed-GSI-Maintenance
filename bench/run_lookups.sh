@@ -8,7 +8,7 @@
 # have no local index on email/name, so broadcast means a scan on every shard;
 # run with LOCAL_INDEX=1 to add per-shard indexes first (fairer baseline).
 set -e
-export MSYS_NO_PATHCONV=1       # Git Bash: don't rewrite /tmp/... into a Windows path
+export MSYS_NO_PATHCONV=1       
 SECS=${1:-20}
 CLIENTS=${2:-4}
 cd "$(dirname "$0")/../docker"

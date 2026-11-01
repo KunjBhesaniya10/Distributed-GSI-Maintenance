@@ -14,7 +14,12 @@ CREATE USER MAPPING FOR PUBLIC SERVER shard5 OPTIONS (user 'postgres');
 INSERT INTO gsi.gsi_node VALUES (0, 'shard1'), (1, 'shard2'), (2, 'shard3'), (3, 'shard4'), (4, 'shard5');
 
 -- Foreign partitions can't carry a PK; each shard's PK enforces id uniqueness.
-CREATE TABLE users (id bigint NOT NULL, email text NOT NULL, name text) PARTITION BY HASH (id);
+-- ids come from a coordinator sequence (the default is applied before tuple
+-- routing); PG16 has no identity columns on partitioned tables.
+CREATE SEQUENCE users_id_seq;
+CREATE TABLE users (id bigint NOT NULL DEFAULT nextval('users_id_seq'), email text NOT NULL, name text)
+    PARTITION BY HASH (id);
+ALTER SEQUENCE users_id_seq OWNED BY users.id;
 CREATE FOREIGN TABLE users_p0 PARTITION OF users FOR VALUES WITH (MODULUS 5, REMAINDER 0)
     SERVER shard1 OPTIONS (table_name 'users_shard');
 CREATE FOREIGN TABLE users_p1 PARTITION OF users FOR VALUES WITH (MODULUS 5, REMAINDER 1)

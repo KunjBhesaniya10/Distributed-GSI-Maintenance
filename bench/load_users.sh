@@ -4,7 +4,6 @@
 #
 #   bash bench/load_users.sh [rows] [sessions]      default: 1000000 rows, 8 sessions
 #
-# Data (deterministic, so every run and every laptop gets the same table):
 #   id     1..rows
 #   email  user<id>@<one of 5 domains>                unique   -> unique GSI users_email
 #   name   '<first> <last>' from 40 x 40 common names   1,600 distinct, ~rows/1600 each
@@ -56,6 +55,8 @@ secs=$(( end - start )); [ $secs -eq 0 ] && secs=1
 echo "loaded in ${secs}s ($(( ROWS / secs )) rows/s)"
 
 psql_c <<'EOF'
+-- the loader sets ids explicitly; move the sequence past them (no-op on old clusters without it)
+SELECT setval(to_regclass('users_id_seq'), (SELECT max(id) FROM users));
 ANALYZE users;
 SELECT count(*) AS rows FROM users;
 SELECT tableoid::regclass AS partition, count(*) FROM users GROUP BY 1 ORDER BY 1;
