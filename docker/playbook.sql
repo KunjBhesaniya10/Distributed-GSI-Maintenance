@@ -16,7 +16,7 @@ SELECT to_regclass('public.users') IS NOT NULL AND to_regclass('gsi.gsi_index') 
 -- fresh unique GSI on users.email (drop first: TRUNCATE does not maintain the index)
 SELECT gsi_drop('users') WHERE EXISTS (SELECT 1 FROM gsi.gsi_index WHERE base_table = 'users'::regclass);
 TRUNCATE users;
-SELECT gsi_create('users', 'email', true);
+CALL gsi_create('users', 'email', true);
 
 INSERT INTO users VALUES
     (1, 'frank@x', 'Frank'),

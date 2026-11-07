@@ -4,7 +4,9 @@
 #
 #   bash bench/run_lookups.sh [seconds] [clients]     default: 20 s, 4 clients
 #
-# Broadcast runs the same query with SET gsi.enable_lookup = off.  The shards
+# Broadcast runs the same query with SET gsi.enable_lookup = off.  -M prepared:
+# with use_remote_estimate every planning asks each shard (EXPLAIN), so a
+# per-statement plan would mostly measure planning.  The shards
 # have no local index on email/name, so broadcast means a scan on every shard;
 # run with LOCAL_INDEX=1 to add per-shard indexes first (fairer baseline).
 set -e
@@ -31,8 +33,10 @@ for script in lookup_email lookup_name; do
     docker compose cp "../bench/$script.sql" "coordinator:/tmp/$script.sql" >/dev/null
     for mode in on off; do
         label=$([ $mode = on ] && echo "GSI      " || echo "broadcast")
-        out=$(docker compose exec -T -e PGOPTIONS="-c gsi.enable_lookup=$mode" coordinator \
-              pgbench -U postgres -n -M simple -c "$CLIENTS" -j "$CLIENTS" -T "$SECS" \
+        # force each plan: with the cost model the planner may pick either one
+        opt=$([ $mode = on ] && echo "gsi.force_lookup=on" || echo "gsi.enable_lookup=off")
+        out=$(docker compose exec -T -e PGOPTIONS="-c $opt" coordinator \
+              pgbench -U postgres -n -M prepared -c "$CLIENTS" -j "$CLIENTS" -T "$SECS" \
                       -D rows="$ROWS" -f "/tmp/$script.sql" postgres 2>&1)
         tps=$(echo "$out" | sed -n 's/^tps = \([0-9.]*\).*/\1/p')
         lat=$(echo "$out" | sed -n 's/^latency average = \(.*\)$/\1/p')

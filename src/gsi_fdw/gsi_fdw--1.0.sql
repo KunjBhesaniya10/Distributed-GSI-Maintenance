@@ -54,8 +54,25 @@ CREATE TABLE gsi.gsi_index (
     UNIQUE (base_table, column_name)            -- one GSI per column, many per table
 );
 
-CREATE FUNCTION gsi_create(base regclass, col name, is_unique boolean DEFAULT false)
-RETURNS text
+-- Online build: last backfilled id per base node, committed with each chunk
+CREATE TABLE gsi.gsi_build_progress (
+    index_name  name NOT NULL,
+    node        int NOT NULL,
+    last_id     bigint NOT NULL,
+    done        boolean NOT NULL DEFAULT false,
+    PRIMARY KEY (index_name, node)
+);
+
+-- Builds online (status write-only -> backfill -> ready); calling it again
+-- on an unfinished build resumes it.  Not inside a transaction block.
+CREATE PROCEDURE gsi_create(base regclass, col name, is_unique boolean DEFAULT false,
+                            mode text DEFAULT 'sync')
+AS 'MODULE_PATHNAME'
+LANGUAGE C;
+
+-- Async GSIs: outbox rows not yet applied, per node
+CREATE FUNCTION gsi_lag(OUT node int, OUT pending bigint, OUT oldest_secs float8)
+RETURNS SETOF record
 AS 'MODULE_PATHNAME'
 LANGUAGE C STRICT;
 

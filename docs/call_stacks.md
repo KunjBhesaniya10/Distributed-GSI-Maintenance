@@ -161,7 +161,7 @@ Stops in [`gsi_begin_modify`](../src/gsi_fdw/gsi.c#L309): `ERROR: cannot update 
     - evaluate the key → [`gsi_node_for_datum`](../src/gsi_fdw/gsi.c#L181) → index node
     - **hop 1**, [`remote_query`](../src/gsi_fdw/gsi_scan.c#L323-L336) → [fdw] `GetConnection` → `SELECT id, shard FROM public.gsi_users_email WHERE key = $1`
     - group the ids by `shard`
-    - **hop 2**, for each listed shard only: `remote_query` → `SELECT ... WHERE id = ANY('{...}')`
+    - **hop 2**, for each listed shard only, all sent before any result is read: [fdw] `GetConnection` → `PQsendQueryParams` `SELECT ... WHERE id = ANY('{...}')`; then `pgfdw_get_result` per shard, in shard order
     - [fdw] `set_transmission_modes`; [PG] `BuildTupleFromCStrings` → buffer
   - each call returns the next buffered row (`ExecForceStoreHeapTuple`)
   - [PG] `ExecScan` evaluates the plan filter `email = 'a@x'`: **the recheck**, which drops stale entries

@@ -1,0 +1,11 @@
+shard_index,key,est_entries,gsi_ms,gsi_p99,bcast_ms,bcast_p99,speedup,planner,faster,correct
+False,email,1.0,1.992,3.052,68.178,92.664,34.23,gsi,gsi,True
+False,1,2.0,1.984,2.935,70.622,116.841,35.6,gsi,gsi,True
+False,10,5.2,3.359,5.349,76.121,124.408,22.66,gsi,gsi,True
+False,100,100.0,4.027,5.864,70.614,100.296,17.54,gsi,gsi,True
+False,1000,1000.0,7.145,11.174,74.307,109.034,10.4,gsi,gsi,True
+True,email,1.0,1.837,2.902,4.187,6.342,2.28,gsi,gsi,True
+True,1,2.0,2.076,3.366,4.566,7.406,2.2,gsi,gsi,True
+True,10,4.8,3.634,6.138,4.745,7.154,1.31,gsi,gsi,True
+True,100,100.0,4.376,6.593,4.818,7.19,1.1,broadcast,gsi,False
+True,1000,1000.0,7.758,15.899,8.851,19.366,1.14,broadcast,gsi,False

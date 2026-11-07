@@ -5,6 +5,7 @@ transaction may be left on any node.
 Run standalone:  python tests/checker.py
 """
 import sys
+import time
 
 from conftest import COORD, SHARDS, connect, q
 
@@ -51,8 +52,17 @@ def check_all(coord, shards):
     return {name: check(coord, shards, f"gsi_{name}", col) for name, col in gsis(coord)}
 
 
+def wait_drained(coord, timeout=30):
+    """Wait until the async outboxes are empty (async GSIs are exact only then)."""
+    deadline = time.time() + timeout
+    while q(coord, "SELECT coalesce(sum(pending), 0) FROM gsi_lag()")[0][0] > 0:
+        assert time.time() < deadline, "async outboxes did not drain"
+        time.sleep(0.1)
+
+
 def assert_consistent(coord, shards):
     """Assert every GSI is exact; return the base row count."""
+    wait_drained(coord)
     rows = sum(q(s, "SELECT count(*) FROM users_shard")[0][0] for s in shards)
     for name, r in check_all(coord, shards).items():
         bad = {k: v for k, v in r.items() if k != "rows" and v}
@@ -63,6 +73,7 @@ def assert_consistent(coord, shards):
 if __name__ == "__main__":
     c = connect(COORD)
     ss = [connect(p) for p in SHARDS]
+    wait_drained(c, timeout=600)
     ok = True
     for name, r in check_all(c, ss).items():
         print(f"{name}: rows={r['rows']} missing={len(r['missing'])} orphaned={len(r['orphaned'])} "

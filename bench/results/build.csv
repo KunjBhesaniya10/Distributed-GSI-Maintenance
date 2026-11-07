@@ -1,0 +1,5 @@
+chunk_size,concurrent_writes,build_s,before_tps,before_p99_ms,during_tps,during_p99_ms,after_tps,after_p99_ms
+1000,False,55.2,,,,,,
+1000,True,118.3,114.2,67.04,65.8,231.68,65.0,316.21
+10000,True,27.4,239.2,57.82,89.3,153.53,96.0,76.78
+50000,True,20.2,96.8,71.91,199.1,164.45,261.0,29.2

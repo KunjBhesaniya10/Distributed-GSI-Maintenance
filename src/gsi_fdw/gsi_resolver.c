@@ -38,7 +38,7 @@ PG_FUNCTION_INFO_V1(gsi_resolve);
 
 PGDLLEXPORT void gsi_resolver_main(Datum main_arg);
 
-static char *gsi_resolver_database = NULL;
+char	   *gsi_resolver_database = NULL;
 static int	gsi_resolver_interval = 5000;
 static int	gsi_resolver_grace = 10;
 

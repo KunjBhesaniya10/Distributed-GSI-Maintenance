@@ -93,6 +93,9 @@ static bool xact_got_connection = false;
 /* true if this transaction wrote a GSI table; commit then uses 2PC */
 static bool gsi_xact_2pc = false;
 
+/* this transaction wrote base rows of a table whose GSIs are all async */
+static bool gsi_xact_async = false;
+
 /*
  * Milliseconds to wait to cancel an in-progress query or execute a cleanup
  * query; if it takes longer than 30 seconds to do these, we assume the
@@ -165,6 +168,8 @@ static void pgfdw_security_check(const char **keywords, const char **values,
 static bool UserMappingPasswordRequired(UserMapping *user);
 static bool disconnect_cached_connections(Oid serverid);
 static void gsi_log_xid(void);
+static int	gsi_open_remote_xacts(void);
+static void gsi_trace_participants(void);
 static void gsi_prepare_remote_xact(ConnCacheEntry *entry);
 static void gsi_finish_prepared(bool commit);
 
@@ -1006,13 +1011,27 @@ pgfdw_xact_callback(XactEvent event, void *arg)
 		else if (event == XACT_EVENT_ABORT || event == XACT_EVENT_PARALLEL_ABORT)
 			gsi_finish_prepared(false);
 	}
+	if (event == XACT_EVENT_COMMIT || event == XACT_EVENT_PARALLEL_COMMIT ||
+		event == XACT_EVENT_ABORT || event == XACT_EVENT_PARALLEL_ABORT)
+		gsi_xact_async = false;
 
 	/* Quick exit if no connections were touched in this transaction. */
 	if (!xact_got_connection)
 		return;
 
+	/*
+	 * Writes that only fed async GSIs (base rows + outbox rows) need 2PC only
+	 * when they span several nodes; on one node a plain COMMIT is atomic.
+	 */
+	if (gsi_xact_async && !gsi_xact_2pc && event == XACT_EVENT_PRE_COMMIT &&
+		gsi_open_remote_xacts() > 1)
+		gsi_xact_2pc = true;
+
 	if (gsi_xact_2pc && event == XACT_EVENT_PRE_COMMIT)
+	{
 		gsi_log_xid();
+		gsi_trace_participants();
+	}
 
 	/*
 	 * Scan all connection cache entries to find open remote transactions, and
@@ -1144,7 +1163,13 @@ pgfdw_xact_callback(XactEvent event, void *arg)
 	}
 
 	if (gsi_xact_2pc && event == XACT_EVENT_PRE_COMMIT)
+	{
+		GSI_TRACE("gsi: all participants prepared; the local commit of xid " UINT64_FORMAT
+				  " is the decision: commit",
+				  U64FromFullTransactionId(GetTopFullTransactionId()));
 		gsi_fail_point("after_prepare");
+		gsi_pause_point("after_prepare");
+	}
 
 	/*
 	 * Regardless of the event type, we can now mark ourselves as out of the
@@ -2310,6 +2335,52 @@ gsi_mark_conn(PGconn *conn, bool is_index)
 	}
 }
 
+/* Note a base write whose table has only async GSIs (see pgfdw_xact_callback). */
+void
+gsi_note_async_write(void)
+{
+	gsi_xact_async = true;
+}
+
+/* Number of connections with an open remote transaction */
+static int
+gsi_open_remote_xacts(void)
+{
+	HASH_SEQ_STATUS scan;
+	ConnCacheEntry *entry;
+	int			n = 0;
+
+	hash_seq_init(&scan, ConnectionHash);
+	while ((entry = (ConnCacheEntry *) hash_seq_search(&scan)))
+		if (entry->conn != NULL && entry->xact_depth > 0)
+			n++;
+	return n;
+}
+
+/* gsi.trace: list the 2PC participants and their roles */
+static void
+gsi_trace_participants(void)
+{
+	HASH_SEQ_STATUS scan;
+	ConnCacheEntry *entry;
+	StringInfoData buf;
+
+	if (!gsi_trace)
+		return;
+	initStringInfo(&buf);
+	hash_seq_init(&scan, ConnectionHash);
+	while ((entry = (ConnCacheEntry *) hash_seq_search(&scan)))
+	{
+		if (entry->conn == NULL || entry->xact_depth <= 0)
+			continue;
+		appendStringInfo(&buf, "%s%s (%s)", buf.len > 0 ? ", " : "",
+						 GetForeignServer(entry->serverid)->servername,
+						 entry->gsi_index ? "index" : "base");
+	}
+	GSI_TRACE("gsi: 2PC for xid " UINT64_FORMAT ", participants: %s",
+			  U64FromFullTransactionId(GetTopFullTransactionId()), buf.data);
+}
+
 /*
  * A transaction that only wrote remotely has no WAL record carrying its xid,
  * so after a crash the xid could be handed out again and a later commit
@@ -2336,6 +2407,8 @@ gsi_prepare_remote_xact(ConnCacheEntry *entry)
 	snprintf(sql, sizeof(sql), "PREPARE TRANSACTION '%s'", entry->gsi_gid);
 
 	/* An aborted remote xact answers PREPARE with ROLLBACK; treat as failure */
+	GSI_TRACE("gsi: PREPARE TRANSACTION '%s' on %s ...", entry->gsi_gid,
+			  GetForeignServer(entry->serverid)->servername);
 	res = pgfdw_exec_query(entry->conn, sql, NULL);
 	if (PQresultStatus(res) != PGRES_COMMAND_OK)
 		pgfdw_report_error(ERROR, res, entry->conn, true, sql);
@@ -2349,6 +2422,7 @@ gsi_prepare_remote_xact(ConnCacheEntry *entry)
 	}
 	PQclear(res);
 	entry->gsi_prepared = true;
+	GSI_TRACE("gsi:   ... prepared on %s", GetForeignServer(entry->serverid)->servername);
 }
 
 static void
@@ -2360,6 +2434,8 @@ gsi_finish_prepared(bool commit)
 
 	if (commit)
 		gsi_fail_point("after_local_commit");
+	else
+		GSI_TRACE("gsi: decision: abort; rolling back every participant");
 
 	/* pass 0: index participants, pass 1: base-only participants */
 	for (int pass = 0; pass < 2; pass++)
@@ -2380,9 +2456,15 @@ gsi_finish_prepared(bool commit)
 								entry->gsi_gid)));
 				disconnect_pg_server(entry);
 			}
+			else
+				GSI_TRACE("gsi: %s on %s: ok", sql,
+						  GetForeignServer(entry->serverid)->servername);
 		}
 		if (commit && pass == 0)
+		{
 			gsi_fail_point("mid_commit_prepared");
+			gsi_pause_point("mid_commit_prepared");
+		}
 	}
 
 	hash_seq_init(&scan, ConnectionHash);

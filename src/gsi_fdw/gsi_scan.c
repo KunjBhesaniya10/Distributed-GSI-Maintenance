@@ -4,9 +4,11 @@
  *		  GSI read path: planner hook and the GsiLookup custom scan
  *
  * For "indexed_col = Const/Param" on a partitioned table with a ready GSI,
- * set_rel_pathlist_hook adds a GsiLookup path that beats the Append over
- * all partitions.  With several matching GSIs it uses one (a unique one if
- * any); the plan records which.  At run time it does two hops:
+ * set_rel_pathlist_hook adds a GsiLookup path, costed from the expected
+ * number of matching entries and shards (cost_gsi_lookup); the planner keeps
+ * it only if it is cheaper than the Append over all partitions.  With
+ * several matching GSIs it uses one (a unique one if any); the plan records
+ * which.  At run time it does two hops:
  *	1. ask the one index node hash(key) mod N for (id, shard);
  *	2. fetch "WHERE id = ANY(...)" from only the shards it returned.
  * All original quals are rechecked on the fetched rows, so a stale or
@@ -15,6 +17,8 @@
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
+
+#include <math.h>
 
 #include "access/htup_details.h"
 #include "access/table.h"
@@ -26,11 +30,14 @@
 #include "miscadmin.h"
 #include "nodes/extensible.h"
 #include "nodes/value.h"
+#include "optimizer/cost.h"
+#include "optimizer/optimizer.h"
 #include "optimizer/pathnode.h"
 #include "optimizer/paths.h"
 #include "optimizer/restrictinfo.h"
 #include "postgres_fdw.h"
 #include "gsi.h"
+#include "storage/itemid.h"
 #include "utils/builtins.h"
 #include "utils/guc.h"
 #include "utils/lsyscache.h"
@@ -61,6 +68,9 @@ static set_rel_pathlist_hook_type prev_set_rel_pathlist_hook = NULL;
 
 /* gsi.enable_lookup: like enable_indexscan, for comparing against broadcast */
 static bool gsi_enable_lookup = true;
+
+/* gsi.force_lookup: cost the GsiLookup path 0 (benchmarks time both plans) */
+static bool gsi_force_lookup = false;
 
 static Plan *gsi_plan_path(PlannerInfo *root, RelOptInfo *rel,
 						   CustomPath *best_path, List *tlist,
@@ -101,10 +111,11 @@ plan_index_name(CustomScan *cscan)
 
 /*
  * Return the Const/Param compared with the indexed column by the type's
- * default equality operator, or NULL.
+ * default equality operator, or NULL.  *rinfo gets the qual.
  */
 static Expr *
-find_key_clause(RelOptInfo *rel, Index rti, GsiIndex *idx, AttrNumber attnum)
+find_key_clause(RelOptInfo *rel, Index rti, GsiIndex *idx, AttrNumber attnum,
+				RestrictInfo **rinfo)
 {
 	TypeCacheEntry *tce = lookup_type_cache(idx->typid, TYPECACHE_EQ_OPR);
 	ListCell   *lc;
@@ -133,9 +144,138 @@ find_key_clause(RelOptInfo *rel, Index rti, GsiIndex *idx, AttrNumber attnum)
 			continue;
 		if ((IsA(r, Const) && !((Const *) r)->constisnull) ||
 			(IsA(r, Param) && ((Param *) r)->paramkind == PARAM_EXTERN))
+		{
+			*rinfo = ri;
 			return (Expr *) r;
+		}
 	}
 	return NULL;
+}
+
+/*
+ * Mean fdw_startup_cost and fdw_tuple_cost over the nodes, with
+ * postgres_fdw's defaults.  The mean because at plan time the index node of
+ * a $1 key is unknown; in practice all nodes have the same settings.
+ */
+static void
+server_costs(GsiIndex *idx, Cost *startup, Cost *per_tuple)
+{
+	*startup = 0;
+	*per_tuple = 0;
+	for (int i = 0; i < idx->nnodes; i++)
+	{
+		Cost		s = 100.0;		/* DEFAULT_FDW_STARTUP_COST */
+		Cost		t = 0.01;		/* DEFAULT_FDW_TUPLE_COST */
+		ListCell   *lc;
+
+		foreach(lc, GetForeignServer(idx->servers[i])->options)
+		{
+			DefElem    *def = lfirst(lc);
+
+			if (strcmp(def->defname, "fdw_startup_cost") == 0)
+				s = strtod(defGetString(def), NULL);
+			else if (strcmp(def->defname, "fdw_tuple_cost") == 0)
+				t = strtod(defGetString(def), NULL);
+		}
+		*startup += s / idx->nnodes;
+		*per_tuple += t / idx->nnodes;
+	}
+}
+
+/*
+ * Cost of a GsiLookup that matches k index entries (docs/phase2_plan.md §1):
+ *
+ *	S  = N (1 - (1 - 1/N)^k)	expected shards holding the k rows (Cardenas):
+ *								rows are placed by hash(id), unrelated to the key
+ *	C1 = c_rt + c_probe ceil(k/e) + k c_tup		hop 1: one index node; the k
+ *								entries are adjacent in its (key, id) B-tree
+ *	C2 = S c_rt + k c_probe + k c_tup			hop 2: one query per touched shard,
+ *								one primary-key probe per row
+ *	C3 = k qual					recheck of every qual on the coordinator
+ *
+ * c_rt = fdw_startup_cost (one remote query), c_tup = fdw_tuple_cost +
+ * cpu_tuple_cost (ship one row), c_probe = random_page_cost +
+ * cpu_index_tuple_cost + cpu_tuple_cost, e = index entries per page.  Same
+ * constants as postgres_fdw uses for the broadcast Append it is compared with.
+ */
+static void
+cost_gsi_lookup(PlannerInfo *root, RelOptInfo *rel, GsiIndex *idx,
+				double k, double shards, Cost *startup, Cost *total)
+{
+	Cost		c_rt;
+	Cost		c_tup;
+	Cost		c_probe = random_page_cost + cpu_index_tuple_cost + cpu_tuple_cost;
+	double		width = get_typavgwidth(idx->typid, -1) + sizeof(int64) + sizeof(int32) +
+		MAXALIGN(SizeofHeapTupleHeader) + sizeof(ItemIdData);
+	double		per_page = Max(1.0, floor(BLCKSZ / width));
+	QualCost	qual;
+
+	server_costs(idx, &c_rt, &c_tup);
+	c_tup += cpu_tuple_cost;
+	cost_qual_eval(&qual, rel->baserestrictinfo, root);
+
+	/* first row needs hop 1 and one shard */
+	*startup = c_rt * Min(2.0, 1.0 + shards) + qual.startup + rel->reltarget->cost.startup;
+	*total = c_rt + c_probe * ceil(k / per_page) + k * c_tup	/* hop 1 */
+		+ shards * c_rt + k * c_probe + k * c_tup	/* hop 2 */
+		+ k * qual.per_tuple						/* recheck */
+		+ qual.startup + rel->reltarget->cost.startup +
+		rel->reltarget->cost.per_tuple * rel->rows;
+}
+
+/*
+ * Expected index entries for "col = key": 1 for a unique GSI, else the
+ * selectivity from the table's inherited statistics (ANALYZE on the
+ * partitioned table) times its row count.
+ */
+static double
+estimate_entries(PlannerInfo *root, RelOptInfo *rel, Oid relid, GsiIndex *idx,
+				 RestrictInfo *rinfo)
+{
+	Relation	r;
+	double		tuples;
+	double		saved_tuples;
+	Selectivity sel;
+
+	if (idx->is_unique)
+		return 1;
+
+	/*
+	 * Row count: ANALYZE of the partitioned table stores it in the parent's
+	 * reltuples (rel->tuples of an appendrel is only its filtered row count).
+	 * Never analyzed: add up what the partitions know.
+	 */
+	r = table_open(relid, NoLock);
+	tuples = r->rd_rel->reltuples;
+	table_close(r, NoLock);
+	if (tuples < 0)
+	{
+		int			i = -1;
+
+		tuples = 0;
+		while ((i = bms_next_member(rel->live_parts, i)) >= 0)
+		{
+			RelOptInfo *child = rel->part_rels[i];
+
+			if (child != NULL && !IS_DUMMY_REL(child))
+				tuples += child->tuples;
+		}
+	}
+	if (tuples <= 0)
+		tuples = rel->rows;
+
+	/*
+	 * eqsel scales a negative n_distinct (a fraction of the rows) by
+	 * rel->tuples, so give it the table's row count for the call.  The bare
+	 * clause, not the RestrictInfo, so no selectivity cached with the
+	 * filtered count is reused.
+	 */
+	saved_tuples = rel->tuples;
+	rel->tuples = tuples;
+	sel = clause_selectivity(root, (Node *) rinfo->clause, 0, JOIN_INNER, NULL);
+	rel->tuples = saved_tuples;
+
+	return clamp_row_est(sel * tuples);
 }
 
 static void
@@ -144,8 +284,10 @@ gsi_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, Index rti,
 {
 	GsiIndex   *idx = NULL;
 	Expr	   *key = NULL;
+	RestrictInfo *key_rinfo = NULL;
 	CustomPath *cpath;
-	Cost		cheapest = 0;
+	double		k;
+	double		shards;
 	ListCell   *lc;
 
 	if (prev_set_rel_pathlist_hook)
@@ -163,36 +305,38 @@ gsi_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, Index rti,
 	{
 		GsiIndex   *cand = lfirst(lc);
 		Expr	   *cand_key;
+		RestrictInfo *cand_rinfo = NULL;
 
 		if (!cand->is_ready || (idx != NULL && (idx->is_unique || !cand->is_unique)))
 			continue;
-		cand_key = find_key_clause(rel, rti, cand, get_attnum(rte->relid, cand->column));
+		cand_key = find_key_clause(rel, rti, cand, get_attnum(rte->relid, cand->column),
+								   &cand_rinfo);
 		if (cand_key != NULL)
 		{
 			idx = cand;
 			key = cand_key;
+			key_rinfo = cand_rinfo;
 		}
 	}
 	if (idx == NULL)
 		return;
 
-	foreach(lc, rel->pathlist)
-	{
-		Path	   *p = lfirst(lc);
-
-		if (cheapest == 0 || p->total_cost < cheapest)
-			cheapest = p->total_cost;
-	}
+	k = estimate_entries(root, rel, rte->relid, idx, key_rinfo);
+	shards = idx->nnodes * (1.0 - pow(1.0 - 1.0 / idx->nnodes, k));
 
 	cpath = makeNode(CustomPath);
 	cpath->path.pathtype = T_CustomScan;
 	cpath->path.parent = rel;
 	cpath->path.pathtarget = rel->reltarget;
 	cpath->path.rows = rel->rows;
-	/* two round trips instead of N; always cheaper than the broadcast */
-	cpath->path.startup_cost = 0;
-	cpath->path.total_cost = cheapest > 0 ? cheapest * 0.1 : 1;
-	cpath->custom_private = list_make2(key, makeString(pstrdup(idx->name)));
+	cost_gsi_lookup(root, rel, idx, k, shards,
+					&cpath->path.startup_cost, &cpath->path.total_cost);
+	if (gsi_force_lookup)
+		cpath->path.startup_cost = cpath->path.total_cost = 0;
+	/* the estimates ride along for EXPLAIN */
+	cpath->custom_private = list_make4(key, makeString(pstrdup(idx->name)),
+									   makeFloat(psprintf("%.0f", k)),
+									   makeFloat(psprintf("%.2f", shards)));
 	cpath->methods = &gsi_path_methods;
 	add_path(rel, &cpath->path);
 
@@ -217,7 +361,8 @@ gsi_plan_path(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 	cscan->scan.scanrelid = rel->relid;
 	cscan->flags = best_path->flags;
 	cscan->custom_exprs = list_make1(linitial(best_path->custom_private));
-	cscan->custom_private = list_make1(lsecond(best_path->custom_private));	/* index name */
+	/* index name, estimated entries, estimated shards */
+	cscan->custom_private = list_copy_tail(best_path->custom_private, 1);
 	cscan->methods = &gsi_scan_methods;
 	return &cscan->scan.plan;
 }
@@ -349,6 +494,7 @@ gsi_fetch(GsiScanState *gss)
 	TupleDesc	desc = RelationGetDescr(gss->css.ss.ss_currentRelation);
 	GsiIndex   *idx = gss->idx;
 	StringInfoData *ids;
+	PGconn	  **conns;
 	Oid			typoutput;
 	bool		typisvarlena;
 	Datum		key;
@@ -389,18 +535,45 @@ gsi_fetch(GsiScanState *gss)
 	}
 	PQclear(res);
 
-	/* hop 2: only the shards that own candidate rows */
+	/*
+	 * hop 2: only the shards that own candidate rows, all at once.  Every
+	 * query is sent before any result is read, so the wait is about one round
+	 * trip instead of one per shard.  Each shard is a different server and so
+	 * a different connection.  If anything throws while queries are still
+	 * running, abort cleanup cancels them (pgfdw_abort_cleanup), as for any
+	 * busy postgres_fdw connection.
+	 */
+	conns = palloc0(sizeof(PGconn *) * idx->nnodes);
+	for (int shard = 0; shard < idx->nnodes; shard++)
+	{
+		const char *param;
+
+		if (ids[shard].data == NULL || gss->parts[shard].select_sql == NULL)
+			continue;
+		appendStringInfoChar(&ids[shard], '}');
+		param = ids[shard].data;
+		conns[shard] = GetConnection(GetUserMapping(GetUserId(),
+													gss->parts[shard].serverid),
+									 false, NULL);
+		if (!PQsendQueryParams(conns[shard], gss->parts[shard].select_sql,
+							   1, NULL, &param, NULL, NULL, 0))
+			pgfdw_report_error(ERROR, NULL, conns[shard], false,
+							   gss->parts[shard].select_sql);
+		gss->shards_fetched++;
+	}
+
+	/* collect in shard order, so rows come back in the same order as before */
 	for (int shard = 0; shard < idx->nnodes; shard++)
 	{
 		AttInMetadata *attinmeta;
 		char	  **values;
 
-		if (ids[shard].data == NULL || gss->parts[shard].select_sql == NULL)
+		if (conns[shard] == NULL)
 			continue;
-		appendStringInfoChar(&ids[shard], '}');
-		gss->shards_fetched++;
-		res = remote_query(gss->parts[shard].serverid,
-						   gss->parts[shard].select_sql, ids[shard].data);
+		res = pgfdw_get_result(conns[shard], gss->parts[shard].select_sql);
+		if (PQresultStatus(res) != PGRES_TUPLES_OK)
+			pgfdw_report_error(ERROR, res, conns[shard], true,
+							   gss->parts[shard].select_sql);
 
 		attinmeta = TupleDescGetAttInMetadata(desc);
 		values = palloc(sizeof(char *) * desc->natts);
@@ -469,7 +642,13 @@ gsi_explain_scan(CustomScanState *node, List *ancestors, ExplainState *es)
 {
 	GsiScanState *gss = (GsiScanState *) node;
 
-	ExplainPropertyText("GSI", plan_index_name((CustomScan *) node->ss.ps.plan), es);
+	CustomScan *cscan = (CustomScan *) node->ss.ps.plan;
+
+	ExplainPropertyText("GSI", plan_index_name(cscan), es);
+	ExplainPropertyFloat("Estimated Entries", NULL,
+						 floatVal(lsecond(cscan->custom_private)), 0, es);
+	ExplainPropertyFloat("Estimated Shards", NULL,
+						 floatVal(lthird(cscan->custom_private)), 1, es);
 	if (es->analyze && gss->fetched)
 	{
 		ExplainPropertyInteger("Index Node", NULL, gss->index_node, es);
@@ -485,6 +664,14 @@ gsi_scan_init(void)
 							 NULL,
 							 &gsi_enable_lookup,
 							 true,
+							 PGC_USERSET,
+							 0,
+							 NULL, NULL, NULL);
+	DefineCustomBoolVariable("gsi.force_lookup",
+							 "Makes the planner always pick GsiLookup when it applies (benchmarks).",
+							 NULL,
+							 &gsi_force_lookup,
+							 false,
 							 PGC_USERSET,
 							 0,
 							 NULL, NULL, NULL);

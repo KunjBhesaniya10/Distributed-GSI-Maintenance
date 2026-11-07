@@ -11,7 +11,7 @@ from conftest import q, reset_cluster
 @pytest.fixture
 def mgsi(coord, shards):
     reset_cluster(coord, shards, unique=True)
-    q(coord, "SELECT gsi_create('users', 'name')")
+    q(coord, "CALL gsi_create('users', 'name')")
     return coord
 
 
@@ -33,7 +33,7 @@ def test_catalog_and_tables(mgsi, shards):
 
 def test_same_column_twice_rejected(mgsi):
     with pytest.raises(psycopg2.errors.DuplicateObject):
-        q(mgsi, "SELECT gsi_create('users', 'name')")
+        q(mgsi, "CALL gsi_create('users', 'name')")
 
 
 def test_writes_maintain_every_gsi(mgsi, shards):

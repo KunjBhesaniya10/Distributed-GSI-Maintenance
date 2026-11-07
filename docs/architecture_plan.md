@@ -97,7 +97,7 @@ CREATE UNIQUE INDEX ON gsi_users_email (key);             -- only for a UNIQUE G
 1. `node = hash(const) mod N`
 2. **Hop 1:** `SELECT id, shard FROM gsi_users_email WHERE key = $1` on that node.
 3. Group the ids by shard.
-4. **Hop 2:** for each shard that appears, `SELECT ... FROM users_shard WHERE id = ANY($1)`. Shards with no matches receive no query.
+4. **Hop 2:** for each shard that appears, `SELECT ... FROM users_shard WHERE id = ANY($1)`, sent to all those shards at once (then the results are collected), so hop 2 costs about one round trip. Shards with no matches receive no query.
 5. **Recheck** `email = const` on every returned row before emitting it.
 
 ### 6.3 Why recheck, and why no locks
@@ -227,6 +227,8 @@ Why this simple version is correct:
 
 ## 9. Stretch: asynchronous maintenance
 
+> Phase 2 plan: [phase2_plan.md §4](phase2_plan.md#4-async-index-maintenance). This section is the detailed design of its option D4.1(b) (logical decoding).
+
 - Writes touch only the base shard: no index work, no 2PC.
 - Base tables use `REPLICA IDENTITY FULL` so the old key is in WAL.
 - `gsi_decoder` (a C logical-decoding output plugin on each data node) emits `(op, old_key, new_key, id)` for GSI tables, only for **committed** transactions.
@@ -239,6 +241,8 @@ Why this simple version is correct:
 - **Trade-off:** no global uniqueness, because conflicts are only discovered after both base writes have committed. The read-path recheck still prevents wrong rows, but rows can be **missed** until the applier catches up.
 
 ## 10. Stretch: online index build (F1)
+
+> Phase 2 plan: [phase2_plan.md §7](phase2_plan.md#7-online-index-build). This section is the detailed design of its option D7.2(a) (chunked backfill), including the race analysis.
 
 **Goal:** create a GSI on a table that already has rows, without blocking reads or writes. The approach follows F1's schema-change states (Rae et al., VLDB 2013): at every moment the index is either complete or not used for reads.
 
@@ -273,7 +277,7 @@ Holding `FOR SHARE` locks until the 2PC commit is what makes the races safe:
 | DELETE / UPDATE commits **before** the chunk locks the row | The chunk doesn't see the old version (on a serialization error the chunk is retried), so it creates no stale entry |
 | DELETE / UPDATE comes **after** the chunk locked the row | It waits for the chunk to commit, then its sync path removes or replaces the entry the chunk just wrote |
 
-So the backfill never leaves a stale entry, and a unique GSI never gets a false conflict from a deleted row. Chunks are small (e.g. 1,000 ids), so locks are short. If a chunk fails, it's retried. The worker records the last finished chunk, so it can resume after a crash.
+So the backfill never leaves a stale entry, and a unique GSI never gets a false conflict from a deleted row. Chunks are 10,000 ids by default (`gsi.build_chunk_size`; about 0.3 s per chunk in E6), so locks are held briefly. If a chunk fails, it's retried. The worker records the last finished chunk, so it can resume after a crash.
 
 **Uniqueness during backfill:** for a unique GSI, two existing rows with the same key make a backfill insert fail with `unique_violation`. The build then stops, reports the conflicting key, and drops the index (status never reaches `ready`).
 
@@ -287,15 +291,7 @@ So the backfill never leaves a stale entry, and a unique GSI never gets a false 
 
 ## 11. Sync vs async
 
-| | Sync (core) | Async (stretch) |
-|---|---|---|
-| When the index is updated | In the same transaction, via 2PC | After commit, from the WAL stream |
-| Write latency | Higher: extra index write + PREPARE + COMMIT PREPARED round trips | Same as no index |
-| Index freshness | Consistent at commit | Lags by the replication delay |
-| Reads | Never wrong, never miss committed rows | Never wrong (recheck), may miss recent rows |
-| Global uniqueness | Yes | No |
-| Failure handling | Resolver for in-doubt prepared transactions | Slot replay from the last confirmed position |
-| Main code | FDW callbacks, xact callback, resolver | Decoder plugin, applier worker |
+Moved to [phase2_plan.md §4.2](phase2_plan.md#42-what-async-gives-up-has-to-be-in-the-report).
 
 ---
 
@@ -303,10 +299,7 @@ So the backfill never leaves a stale entry, and a unique GSI never gets a false 
 
 - **Consistency checker:** after a randomized concurrent workload, quiesce, read all base rows `{(id, key, shard)}` and all index entries, and assert both sets are equal. Also assert there are no leftover `gsi_%` prepared transactions.
 - **Fault injection:** a GUC `gsi.fail_point = after_prepare | after_local_commit | mid_commit_prepared` that does `abort()` at that step. Restart, wait for the resolver, then run the checker. Separately, `docker pause` a shard during PREPARE to test the abort path.
-- **Benchmarks (pgbench):**
-  - Write TPS and latency: no index vs sync (vs async).
-  - Point lookup latency: GSI vs broadcast with 2, 3 and 4 shards.
-  - Async lag under load.
+- **Benchmarks:** [phase2_plan.md §5](phase2_plan.md#5-benchmarking).
 
 ## 13. Known limitations
 - No cross-node snapshot: multi-row reads can be fractured during the commit window.

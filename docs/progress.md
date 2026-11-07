@@ -26,8 +26,7 @@ This is the record we show the professor at each checkpoint: what was built, how
 | M9 stress + benchmarks | stress done, quick lookup timing done, full benchmarks not started | `test_stress.py` (2) | 2026-10-29 |
 | Per-statement pushdown; several GSIs per table | done | `test_m3_write.py` (+4), `test_multi_gsi.py` (9) | 2026-11-01 |
 | 5 data nodes, 1M-row load, first lookup benchmark | done | full suite on 5 nodes (65), `bench/` | 2026-11-01 |
-| S1 async mode | not started | | |
-| S2 online build | not started | | |
+| Phase 2: cost model, online build, async mode, demo trace, benchmark harness | **done** | 80/80 tests on 5 and 3 nodes, checker clean; benchmarks in phase2_results.md | 2026-11-05 |
 
 ---
 
@@ -197,3 +196,52 @@ This is the record we show the professor at each checkpoint: what was built, how
 
 **Known issues:** single-laptop numbers (all containers share one machine; no network latency between nodes); write-cost and node-count sweeps not run yet.
 
+### Phase 2: cost model, online build, async GSIs, demo additions (2026-11-04)
+
+**Status: implemented and verified (2026-11-05).** Written while Docker Desktop could not start (the Windows hypervisor was switched off: `bcdedit` `hypervisorlaunchtype Off`); built and tested once it was back on. Testing found 3 bugs and 1 test-infrastructure problem, listed below, all fixed. Benchmarks: [phase2_results.md](phase2_results.md).
+
+**What changed** (design and decisions: [phase2_plan.md](phase2_plan.md)):
+- Cost model (§1, D1.1-D1.4): `gsi_scan.c` `cost_gsi_lookup` / `estimate_entries` replace the fixed `0.1 x cheapest` cost: k from the table's inherited statistics (unique: 1), shards `S = N(1-(1-1/N)^k)` (Cardenas), both hops costed with postgres_fdw's constants. EXPLAIN shows `Estimated Entries` / `Estimated Shards`. New GUC `gsi.force_lookup` (benchmarks). `use_remote_estimate 'true'` on every data-node server.
+- Online build (§7, D7.1-D7.4): new `gsi_build.c`; `gsi_create` is now a procedure, `CALL gsi_create(table, col, unique, mode)`, always online: write-only, `WaitForLockers`, chunked backfill (FOR SHARE + 2PC per chunk, progress in `gsi.gsi_build_progress`, resumable), validation (count + hash per side, under `ShareLock`), ready, ANALYZE. Duplicate keys in a unique build drop the GSI. GUCs `gsi.build_chunk_size`, `gsi.build_chunk_delay`. The write path reads the GSI catalog with the latest snapshot (so REPEATABLE READ writers see a new write-only index).
+- Async GSIs (§4, D4.1-D4.6): new `gsi_async.c`; `mode => 'async'` (not for unique GSIs); the write path adds an outbox row on the base node; a transaction that only fed async GSIs and touched one node commits without 2PC; `gsi applier <i>` background workers (one per node, `gsi.applier_workers`) apply outboxes idempotently in seq order; `gsi_lag()`.
+- Demo (§6, D6.1-D6.2): `gsi.trace` (2PC steps as NOTICEs), `gsi.pause_point` / `gsi.pause_seconds`.
+- Cluster: `docker/init/coordinator.sh` replaces `coordinator.sql` and takes `NNODES` (2..5, D5.3); data nodes get `gsi_outbox`; `NET_ADMIN` + iproute2 for `bench/net_delay.sh` (D5.2). Tests read `NNODES` from the environment.
+- Tests: `tests/test_phase2.py` (cost model, online build under concurrent writes and after a cancel, async, trace); `test_m2_catalog.py` updated (gsi_create on a full table now backfills). Callers changed from `SELECT gsi_create` to `CALL gsi_create`.
+- Benchmarks: `bench/experiments.py` (E1, E2, E4-E7), `bench/node_sweep.sh`, `bench/net_delay.sh`; `run_lookups.sh` uses `-M prepared` and forces each plan.
+
+**How it was verified so far:** `gcc -fsyntax-only -Wall -Wextra` of the new and changed C files against PostgreSQL 17.2 server headers (MSYS2 package, extracted, not installed): 0 errors, 0 warnings in `gsi.c`, `gsi_scan.c`, `gsi_build.c`, `gsi_async.c`, `gsi_resolver.c`. (Upstream `connection.c` / `postgres_fdw.c` show only the known PG16 -> 17 API differences, e.g. `create_foreignscan_path` arity; the build target is PG16.) `python -m py_compile` and `bash -n` on all scripts.
+
+**Verified in the cluster** (PostgreSQL 16, Docker Desktop, after the fixes below):
+1. `docker compose down -v && docker compose up -d --build`: the extension compiles against PG16 with no warnings; coordinator runs 1 `gsi resolver` + 5 `gsi applier` workers; every server has `use_remote_estimate=true`.
+2. 5 data nodes, fresh cluster: `python -m pytest -q .` -> **80 passed** (186 s); `python checker.py` -> `users_email: rows=91 missing=0 orphaned=0 misplaced=0 prepared=0`.
+3. `NNODES=3`, fresh cluster: **80 passed** (186 s); checker `rows=96 missing=0 orphaned=0 misplaced=0 prepared=0`.
+4. The race-sensitive build tests (`concurrent`, `resumes`, `cached`) passed 5 runs in a row.
+5. Benchmarks: [phase2_results.md](phase2_results.md).
+
+**Bugs found by running it (2026-11-05, Docker working again; all fixed):**
+1. *Cost model, k far too high* (`gsi_scan.c` `estimate_entries`): for a name occurring once, `Estimated Entries: 250` instead of 1, so the planner broadcast. eqsel turns a negative `n_distinct` (a fraction of the rows) into a count with `rel->tuples`, which for a partitioned table at this point is only the ~20 filtered rows: 0.5005 × 20 ≈ 10 distinct, 8 of them non-MCV, 0.5 / 8 × 4000 = 250. Fix: `rel->tuples` set to the table's row count for the selectivity call, and the bare clause passed (no cached selectivity reused).
+2. *Online build, index table not there yet* (`gsi_build.c`): a concurrent writer failed with `relation "public.gsi_users_name" does not exist`. The remote CREATE TABLE ran in the same transaction as the catalog insert, and the coordinator commits locally (the 2PC decision) before COMMIT PREPARED reaches the nodes, so the write-only row was visible first. Fix: create the tables and commit, then insert the catalog row in a second transaction; leftovers of a build that failed between the two (empty, unreferenced) are dropped.
+3. *Online build, UPDATE planned before the build* (`gsi.c` `gsi_begin_modify`): `could not find GSI junk column "gsi_old_id"`: a writer planned before the write-only row existed executed after it. Such a writer holds its lock since planning, so `WaitForLockers` waits for it and the backfill covers its rows: it now skips a write-only GSI its plan doesn't know (a ready one must still be planned). Also: a cached generic plan made before the build would have skipped the GSI for good; creating, readying and dropping a GSI now invalidate the base table's relcache entry so cached plans are replanned (new test `test_cached_plan_is_replanned_after_build`).
+4. *Test infrastructure:* in the full 5-node run two coordinator-crash tests failed to reconnect: one restart took 67 s (> the tests' 60 s), all of it PostgreSQL fsyncing every data file before crash recovery, slow on Docker Desktop's disk. `recovery_init_sync_method=syncfs` on all nodes (docker-compose.yml). Both tests passed on rerun before the change.
+
+**Known issues / deviations:**
+- The outbox row is a separate statement on the base connection (one extra round trip to the same node), not merged into postgres_fdw's prepared INSERT as the plan suggested: merging would mean rewriting postgres_fdw's statement.
+- Validation of an online build briefly pauses new writes (`ShareLock`); see `gsi_create` and E6.
+- With `use_remote_estimate`, planning a statement on `users` opens remote transactions on every planned shard; inside a write transaction these become read-only 2PC participants (PREPAREd too). Prepared statements avoid repeated planning.
+
+### Phase 2 follow-ups from the benchmarks (2026-11-05)
+
+Chosen by the user from the "possible next steps" in [phase2_results.md](phase2_results.md):
+
+1. **Parallel hop 2** (`gsi_scan.c` `gsi_fetch`): the per-shard SELECTs are all sent (`PQsendQueryParams`) before any result is read, so hop 2 waits about one round trip instead of one per shard. Small choices:
+   - *Results are collected in shard order*, so a lookup returns rows in the same order as before. Waiting on the slowest shard first or last costs the same total time.
+   - *No new connection handling.* Each shard is a different server, so it has its own cached connection and two queries never share one. If something throws while queries are still running (a cancel, a remote error), postgres_fdw's abort cleanup already cancels busy connections (`pgfdw_abort_cleanup`, `PQTRANS_ACTIVE`).
+   - *Hop 1 stays one query to one node*, and hop 2 starts after it (it needs hop 1's ids), so a lookup is two round trips at any shard count.
+2. **Coordinator xid only for 2PC** (`gsi.c` `gsi_begin_modify`): no longer calls `GetTopFullTransactionId()` for every GSI write; `gsi_log_xid()` assigns the xid at pre-commit when the commit is 2PC (any sync GSI write, or async writes spanning several nodes). A write that fed only async GSIs on one node has no coordinator xid, so no local commit record and no WAL flush. Checked against PG16 `xact.c`: PRE_COMMIT callbacks run while the state is still `TRANS_INPROGRESS`, so assigning an xid there is allowed (the only runtime check forbids it during parallel operations), and `RecordTransactionCommit` writes and flushes a commit record only if an xid was assigned.
+3. **`gsi.build_chunk_size` default 10,000** (was 1,000; `gsi_build.c`): E6 measured 27 s instead of 118 s per 1M rows, at the price of longer `FOR SHARE` lock hold per chunk for concurrent writers.
+
+New tests (`tests/test_phase2.py`): a lookup spanning every shard returns all rows (`Shards Fetched: N`); one shard blocked by a lock while others answer, the statement cancelled by `statement_timeout` with queries in flight, then the same session's next lookup is correct and nothing is left running on the shards; an async-only one-node write has no coordinator xid (`pg_current_xact_id_if_assigned()` is NULL).
+
+**Verified:** image rebuilt (no compiler warnings); fresh 5-node cluster: `python -m pytest -q .` **83 passed** (152 s), checker `users_email: rows=87 missing=0 orphaned=0 misplaced=0 prepared=0`. Coordinator WAL flushes per single-row insert (`pg_stat_wal`): async 0.02 (noise), sync 1.95. Benchmarks E1 (0/1 ms), E2, E7 rerun: see phase2_results.md; the sequential-hop-2 results are kept in `bench/results/sequential_hop2/`. Note: E7 leaves a `customer` table with a GSI in the catalog, and the tests expect only the `users` GSIs (9 failed for that reason when run right after the benchmarks), so run the tests on a fresh cluster after E7.
+
+**Bench file names (2026-11-05):** renamed so each name says what it is. Scripts: `phase2.py` → `experiments.py`, `e3_nodes.sh` → `node_sweep.sh`, `netem.sh` → `net_delay.sh`. Commands: `e1`/`e2`/`e4`/`e5`/`e6`/`e7` → `lookups`/`writes`/`hot_keys`/`async_lag`/`build`/`tpcc`. Results: `<experiment>[_<N>nodes][_<tag>].csv`, e.g. `lookups_5nodes_1ms.csv`; the new `--tag` option sets the suffix (before, the 0 ms / 1 ms copies were made by hand). The experiment labels E1-E7 stay as section names in the plan and results docs; `bench/README.md` maps each to its command and files. Docs updated to match.

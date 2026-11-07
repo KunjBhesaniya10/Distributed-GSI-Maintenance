@@ -30,14 +30,18 @@
 #include "gsi.h"
 #include "utils/builtins.h"
 #include "utils/guc.h"
+#include "utils/inval.h"
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
+#include "utils/snapmgr.h"
 #include "utils/typcache.h"
 
 int			gsi_remote_lock_timeout = 5000;
+bool		gsi_trace = false;
 static char *gsi_fail_point_name = NULL;
+static char *gsi_pause_point_name = NULL;
+static int	gsi_pause_seconds = 20;
 
-PG_FUNCTION_INFO_V1(gsi_create);
 PG_FUNCTION_INFO_V1(gsi_drop);
 PG_FUNCTION_INFO_V1(gsi_node_for);
 
@@ -62,8 +66,37 @@ gsi_init(void)
 							   0,
 							   NULL, NULL, NULL);
 
+	DefineCustomBoolVariable("gsi.trace",
+							 "Reports each 2PC step of GSI transactions as a NOTICE.",
+							 NULL,
+							 &gsi_trace,
+							 false,
+							 PGC_USERSET,
+							 0,
+							 NULL, NULL, NULL);
+
+	DefineCustomStringVariable("gsi.pause_point",
+							   "Sleeps gsi.pause_seconds at the named commit step (demo only).",
+							   NULL,
+							   &gsi_pause_point_name,
+							   "",
+							   PGC_SUSET,
+							   0,
+							   NULL, NULL, NULL);
+
+	DefineCustomIntVariable("gsi.pause_seconds",
+							"Length of the gsi.pause_point sleep.",
+							NULL,
+							&gsi_pause_seconds,
+							20, 0, 3600,
+							PGC_SUSET,
+							GUC_UNIT_S,
+							NULL, NULL, NULL);
+
 	gsi_resolver_init();
 	gsi_scan_init();
+	gsi_build_init();
+	gsi_async_init();
 	MarkGUCPrefixReserved("gsi");
 }
 
@@ -79,6 +112,23 @@ gsi_fail_point(const char *name)
 		ereport(LOG,
 				(errmsg("gsi fail point \"%s\" reached, aborting process", name)));
 		abort();
+	}
+}
+
+/*
+ * Stop at a commit step so a node can be killed by hand in the window.  No
+ * CHECK_FOR_INTERRUPTS: some steps run after the commit decision, where an
+ * ERROR is not allowed.
+ */
+void
+gsi_pause_point(const char *name)
+{
+	if (gsi_pause_point_name && strcmp(gsi_pause_point_name, name) == 0)
+	{
+		ereport(NOTICE,
+				(errmsg("gsi: paused at \"%s\" for %d s", name, gsi_pause_seconds)));
+		pg_usleep((long) gsi_pause_seconds * 1000000L);
+		ereport(NOTICE, (errmsg("gsi: resuming after \"%s\"", name)));
 	}
 }
 
@@ -110,38 +160,37 @@ gsi_load_nodes(int *nnodes, MemoryContext cxt)
 	return servers;
 }
 
+/* GsiIndex rows: name, column, unique, ready, async, type, collation */
+#define GSI_INDEX_COLUMNS \
+	"SELECT i.index_name, i.column_name, i.is_unique, i.status = 'ready', " \
+	"i.mode = 'async', a.atttypid, a.attcollation " \
+	"FROM gsi.gsi_index i JOIN pg_catalog.pg_attribute a " \
+	"ON a.attrelid = i.base_table AND a.attname = i.column_name "
+
 /*
- * Return the sync GSIs on relid (a partitioned table or one of its
- * partitions), ordered by index name, or NIL.
+ * Run a gsi.gsi_index query and build a GsiIndex per row, in cxt.  Caller is
+ * in SPI.
+ *
+ * The catalog is read with the latest snapshot, not the transaction's: a
+ * REPEATABLE READ writer must see an index created after its snapshot was
+ * taken, or it would skip maintaining an index being built (gsi_build.c).
+ * Not read_only, so rows written earlier in this transaction are seen too.
  */
-List *
-gsi_indexes_for_rel(Oid relid)
+static List *
+read_indexes(const char *sql, Oid argtype, Datum arg, MemoryContext cxt)
 {
-	MemoryContext cxt = CurrentMemoryContext;
 	List	   *indexes = NIL;
-	Oid		   *servers = NULL;
-	int			nnodes = 0;
-	Oid			argtypes[1] = {REGCLASSOID};
-	Datum		args[1];
+	SPIPlanPtr	plan = SPI_prepare(sql, 1, &argtype);
+	Oid		   *servers;
+	int			nnodes;
 
-	if (!OidIsValid(get_namespace_oid("gsi", true)))
-		return NIL;
-	if (get_rel_relispartition(relid))
-		relid = get_partition_parent(relid, false);
-	args[0] = ObjectIdGetDatum(relid);
-
-	/* not read_only: also see catalog rows written earlier in this xact */
-	SPI_connect();
-	if (SPI_execute_with_args("SELECT i.index_name, i.column_name, i.is_unique, "
-							  "i.status = 'ready', a.atttypid, a.attcollation "
-							  "FROM gsi.gsi_index i JOIN pg_catalog.pg_attribute a "
-							  "ON a.attrelid = i.base_table AND a.attname = i.column_name "
-							  "WHERE i.base_table = $1 AND i.mode = 'sync' "
-							  "ORDER BY i.index_name",
-							  1, argtypes, args, NULL, false, 0) != SPI_OK_SELECT)
+	if (plan == NULL ||
+		SPI_execute_snapshot(plan, &arg, NULL, GetLatestSnapshot(),
+							 InvalidSnapshot, false, false, 0) != SPI_OK_SELECT)
 		elog(ERROR, "could not read gsi.gsi_index");
+	if (SPI_processed == 0)
+		return NIL;
 
-	if (SPI_processed > 0)
 	{
 		SPITupleTable *tuptable = SPI_tuptable;
 		uint64		nrows = SPI_processed;
@@ -159,8 +208,9 @@ gsi_indexes_for_rel(Oid relid)
 			idx->column = pstrdup(NameStr(*DatumGetName(SPI_getbinval(tup, desc, 2, &isnull))));
 			idx->is_unique = DatumGetBool(SPI_getbinval(tup, desc, 3, &isnull));
 			idx->is_ready = DatumGetBool(SPI_getbinval(tup, desc, 4, &isnull));
-			idx->typid = DatumGetObjectId(SPI_getbinval(tup, desc, 5, &isnull));
-			idx->collid = DatumGetObjectId(SPI_getbinval(tup, desc, 6, &isnull));
+			idx->is_async = DatumGetBool(SPI_getbinval(tup, desc, 5, &isnull));
+			idx->typid = DatumGetObjectId(SPI_getbinval(tup, desc, 6, &isnull));
+			idx->collid = DatumGetObjectId(SPI_getbinval(tup, desc, 7, &isnull));
 			idx->remote_table = psprintf("public.%s",
 										 quote_identifier(psprintf("gsi_%s", idx->name)));
 			idx->servers = servers;
@@ -169,9 +219,56 @@ gsi_indexes_for_rel(Oid relid)
 			MemoryContextSwitchTo(oldcxt);
 		}
 	}
-	SPI_finish();
-
 	return indexes;
+}
+
+/*
+ * Return the GSIs on relid (a partitioned table or one of its partitions),
+ * sync and async, any status, ordered by index name, or NIL.
+ */
+List *
+gsi_indexes_for_rel(Oid relid)
+{
+	MemoryContext cxt = CurrentMemoryContext;
+	List	   *indexes;
+
+	if (!OidIsValid(get_namespace_oid("gsi", true)))
+		return NIL;
+	if (get_rel_relispartition(relid))
+		relid = get_partition_parent(relid, false);
+
+	SPI_connect();
+	indexes = read_indexes(GSI_INDEX_COLUMNS
+						   "WHERE i.base_table = $1 ORDER BY i.index_name",
+						   REGCLASSOID, ObjectIdGetDatum(relid), cxt);
+	SPI_finish();
+	return indexes;
+}
+
+/* The GSI named name, or NULL.  Caller is in a transaction. */
+GsiIndex *
+gsi_index_by_name(const char *name)
+{
+	MemoryContext cxt = CurrentMemoryContext;
+	List	   *indexes;
+
+	SPI_connect();
+	indexes = read_indexes(GSI_INDEX_COLUMNS "WHERE i.index_name = $1",
+						   NAMEOID, DirectFunctionCall1(namein, CStringGetDatum(name)),
+						   cxt);
+	SPI_finish();
+	return indexes ? linitial(indexes) : NULL;
+}
+
+/* Key value from its text form (as stored in the outbox) */
+Datum
+gsi_key_from_text(GsiIndex *idx, const char *text)
+{
+	Oid			typinput;
+	Oid			typioparam;
+
+	getTypeInputInfo(idx->typid, &typinput, &typioparam);
+	return OidInputFunctionCall(typinput, (char *) text, typioparam, -1);
 }
 
 /*
@@ -296,6 +393,28 @@ gsi_begin_modify(Relation rel, CmdType operation, Plan *subplan,
 
 	if (operation == CMD_UPDATE || operation == CMD_DELETE)
 	{
+		List	   *planned = NIL;
+
+		/*
+		 * Planned before a build's write-only catalog row existed: no junk
+		 * columns for that index.  This writer has held its lock since
+		 * planning, so gsi_create waits for it before backfilling and the
+		 * backfill covers its rows.  A ready index must be in the plan.
+		 */
+		foreach(lc, indexes)
+		{
+			GsiIndex   *idx = lfirst(lc);
+
+			if (AttributeNumberIsValid(ExecFindJunkAttributeInTlist(subplan->targetlist,
+																	old_key_junk_name(idx))))
+				planned = lappend(planned, idx);
+			else if (idx->is_ready)
+				elog(ERROR, "could not find GSI junk column for \"%s\"", idx->name);
+		}
+		indexes = planned;
+		if (indexes == NIL)
+			return NIL;
+
 		old_id_junk = ExecFindJunkAttributeInTlist(subplan->targetlist,
 												   "gsi_old_id");
 		if (!AttributeNumberIsValid(old_id_junk))
@@ -324,20 +443,19 @@ gsi_begin_modify(Relation rel, CmdType operation, Plan *subplan,
 		fmgr_info(typoutput, &gs->key_out);
 
 		if (operation == CMD_UPDATE || operation == CMD_DELETE)
-		{
 			gs->old_key_junk = ExecFindJunkAttributeInTlist(subplan->targetlist,
 															old_key_junk_name(idx));
-			if (!AttributeNumberIsValid(gs->old_key_junk))
-				elog(ERROR, "could not find GSI junk column for \"%s\"", idx->name);
-		}
 		if (operation == CMD_UPDATE)
 			gs->key_updated = list_member_int(target_attrs, gs->key_attno);
 		states = lappend(states, gs);
 	}
 
-	/* The coordinator's commit record is the 2PC decision; make sure it exists */
-	(void) GetTopFullTransactionId();
-
+	/*
+	 * No coordinator xid here: only a 2PC commit needs one (its commit record
+	 * is the decision), and gsi_log_xid() assigns it at pre-commit.  A write
+	 * that only fed async GSIs on one node then commits without a local
+	 * commit record and its WAL flush.
+	 */
 	return states;
 }
 
@@ -454,6 +572,57 @@ send_index_op(GsiModifyState *gs, int node, const char *key, int64 id,
 	PQclear(res);
 }
 
+/*
+ * One outbox row on the base node, in the base write's remote transaction:
+ * the applier later deletes old_key's entry and inserts new_key's (either
+ * may be NULL).
+ */
+static void
+send_outbox_op(GsiModifyState *gs)
+{
+	UserMapping *user = GetUserMapping(GetUserId(), gs->idx->servers[gs->base_node]);
+	PGconn	   *conn = GetConnection(user, false, NULL);
+	const char *values[4];
+	const char *sql = "INSERT INTO public.gsi_outbox (index_name, old_key, new_key, id) "
+		"VALUES ($1, $2, $3, $4)";
+	PGresult   *res;
+
+	values[0] = gs->idx->name;
+	values[1] = gs->old_key;
+	values[2] = gs->new_key;
+	values[3] = psprintf(INT64_FORMAT, gs->new_key ? gs->new_id : gs->old_id);
+
+	if (!PQsendQueryParams(conn, sql, 4, NULL, values, NULL, NULL, 0))
+		pgfdw_report_error(ERROR, NULL, conn, false, sql);
+	res = pgfdw_get_result(conn, sql);
+	if (PQresultStatus(res) != PGRES_COMMAND_OK)
+		pgfdw_report_error(ERROR, res, conn, true, sql);
+	PQclear(res);
+}
+
+/*
+ * The base row is about to be written on conn.  A sync GSI needs 2PC; a
+ * write that only feeds async GSIs commits in one phase unless it ends up
+ * touching several nodes (connection.c decides at pre-commit).
+ */
+void
+gsi_note_base_write(List *states, PGconn *conn)
+{
+	ListCell   *lc;
+
+	foreach(lc, states)
+	{
+		GsiModifyState *gs = lfirst(lc);
+
+		if (!gs->idx->is_async)
+		{
+			gsi_mark_conn(conn, false);
+			return;
+		}
+	}
+	gsi_note_async_write();
+}
+
 /* Apply the captured entries of every GSI after the base write succeeded. */
 void
 gsi_apply_row(List *states)
@@ -464,6 +633,12 @@ gsi_apply_row(List *states)
 	{
 		GsiModifyState *gs = lfirst(lc);
 
+		if (gs->idx->is_async)
+		{
+			if (gs->old_key || gs->new_key)
+				send_outbox_op(gs);
+			continue;
+		}
 		if (gs->old_key)
 			send_index_op(gs, gs->old_node, gs->old_key, gs->old_id, false);
 		if (gs->new_key)
@@ -472,8 +647,8 @@ gsi_apply_row(List *states)
 }
 
 /* Run a DDL command on every node, as part of the distributed transaction. */
-static void
-exec_on_all_nodes(GsiIndex *idx, const char *sql)
+void
+gsi_exec_on_all_nodes(GsiIndex *idx, const char *sql)
 {
 	for (int i = 0; i < idx->nnodes; i++)
 	{
@@ -487,8 +662,8 @@ exec_on_all_nodes(GsiIndex *idx, const char *sql)
 }
 
 /* The GSI on column col, or NULL */
-static GsiIndex *
-index_on_column(List *indexes, const char *col)
+GsiIndex *
+gsi_index_on_column(List *indexes, const char *col)
 {
 	ListCell   *lc;
 
@@ -503,81 +678,29 @@ index_on_column(List *indexes, const char *col)
 }
 
 /*
- * gsi_create(base regclass, col name, is_unique bool) returns text
- *
- * A table can have one GSI per column.  v1 builds the index only on an
- * empty table (no backfill).
+ * Remove one GSI: catalog row, build progress, pending outbox rows and the
+ * index tables, all in the current distributed transaction.
  */
-Datum
-gsi_create(PG_FUNCTION_ARGS)
+void
+gsi_drop_index(GsiIndex *idx)
 {
-	Oid			base = PG_GETARG_OID(0);
-	char	   *col = NameStr(*PG_GETARG_NAME(1));
-	bool		is_unique = PG_GETARG_BOOL(2);
-	Relation	rel;
-	AttrNumber	attnum;
-	char	   *name;
-	char	   *relname;
-	GsiIndex   *idx;
-	Oid			argtypes[4] = {NAMEOID, REGCLASSOID, NAMEOID, BOOLOID};
-	Datum		args[4];
+	Oid			argtypes[1] = {NAMEOID};
+	Datum		args[1];
 
-	rel = table_open(base, AccessExclusiveLock);
-	if (rel->rd_rel->relkind != RELKIND_PARTITIONED_TABLE)
-		ereport(ERROR,
-				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
-				 errmsg("\"%s\" is not a partitioned table",
-						RelationGetRelationName(rel))));
-	attnum = get_attnum(base, col);
-	if (attnum == InvalidAttrNumber)
-		ereport(ERROR,
-				(errcode(ERRCODE_UNDEFINED_COLUMN),
-				 errmsg("column \"%s\" does not exist", col)));
-	if (get_atttype(base, get_attnum(base, "id")) != INT8OID)
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("GSI tables need a bigint column \"id\"")));
-	if (index_on_column(gsi_indexes_for_rel(base), col) != NULL)
-		ereport(ERROR,
-				(errcode(ERRCODE_DUPLICATE_OBJECT),
-				 errmsg("column \"%s\" of table \"%s\" already has a GSI",
-						col, RelationGetRelationName(rel))));
-
-	relname = quote_qualified_identifier(get_namespace_name(RelationGetNamespace(rel)),
-										 RelationGetRelationName(rel));
-	name = psprintf("%s_%s", RelationGetRelationName(rel), col);
-
+	args[0] = DirectFunctionCall1(namein, CStringGetDatum(idx->name));
 	SPI_connect();
-	if (SPI_execute(psprintf("SELECT 1 FROM %s LIMIT 1", relname), true, 1) != SPI_OK_SELECT)
-		elog(ERROR, "could not scan \"%s\"", relname);
-	if (SPI_processed > 0)
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("gsi_create requires an empty table")));
-
-	args[0] = DirectFunctionCall1(namein, CStringGetDatum(name));
-	args[1] = ObjectIdGetDatum(base);
-	args[2] = DirectFunctionCall1(namein, CStringGetDatum(col));
-	args[3] = BoolGetDatum(is_unique);
-	if (SPI_execute_with_args("INSERT INTO gsi.gsi_index "
-							  "(index_name, base_table, column_name, is_unique) "
-							  "VALUES ($1, $2, $3, $4)",
-							  4, argtypes, args, NULL, false, 0) != SPI_OK_INSERT)
-		elog(ERROR, "could not insert into gsi.gsi_index");
+	if (SPI_execute_with_args("DELETE FROM gsi.gsi_index WHERE index_name = $1",
+							  1, argtypes, args, NULL, false, 0) != SPI_OK_DELETE)
+		elog(ERROR, "could not delete from gsi.gsi_index");
+	if (SPI_execute_with_args("DELETE FROM gsi.gsi_build_progress WHERE index_name = $1",
+							  1, argtypes, args, NULL, false, 0) != SPI_OK_DELETE)
+		elog(ERROR, "could not delete from gsi.gsi_build_progress");
 	SPI_finish();
 
-	idx = index_on_column(gsi_indexes_for_rel(base), col);
-	exec_on_all_nodes(idx,
-					  psprintf("CREATE TABLE %s (key %s NOT NULL, id bigint NOT NULL, "
-							   "shard int NOT NULL, PRIMARY KEY (key, id))",
-							   idx->remote_table,
-							   format_type_be_qualified(idx->typid)));
-	if (is_unique)
-		exec_on_all_nodes(idx, psprintf("CREATE UNIQUE INDEX ON %s (key)",
-										idx->remote_table));
-
-	table_close(rel, NoLock);
-	PG_RETURN_TEXT_P(cstring_to_text(name));
+	gsi_exec_on_all_nodes(idx, psprintf("DROP TABLE IF EXISTS %s", idx->remote_table));
+	if (idx->is_async)
+		gsi_exec_on_all_nodes(idx, psprintf("DELETE FROM public.gsi_outbox WHERE index_name = %s",
+											quote_literal_cstr(idx->name)));
 }
 
 /*
@@ -590,7 +713,6 @@ gsi_drop(PG_FUNCTION_ARGS)
 {
 	Oid			base;
 	List	   *indexes;
-	Oid			argtypes[1] = {NAMEOID};
 	Relation	rel;
 	ListCell   *lc;
 
@@ -605,7 +727,7 @@ gsi_drop(PG_FUNCTION_ARGS)
 	if (!PG_ARGISNULL(1))
 	{
 		char	   *col = NameStr(*PG_GETARG_NAME(1));
-		GsiIndex   *idx = index_on_column(indexes, col);
+		GsiIndex   *idx = gsi_index_on_column(indexes, col);
 
 		if (idx == NULL)
 			ereport(ERROR,
@@ -620,20 +742,10 @@ gsi_drop(PG_FUNCTION_ARGS)
 				 errmsg("table \"%s\" has no GSI", RelationGetRelationName(rel))));
 
 	foreach(lc, indexes)
-	{
-		GsiIndex   *idx = lfirst(lc);
-		Datum		args[1];
+		gsi_drop_index(lfirst(lc));
 
-		args[0] = DirectFunctionCall1(namein, CStringGetDatum(idx->name));
-		SPI_connect();
-		if (SPI_execute_with_args("DELETE FROM gsi.gsi_index WHERE index_name = $1",
-								  1, argtypes, args, NULL, false, 0) != SPI_OK_DELETE)
-			elog(ERROR, "could not delete from gsi.gsi_index");
-		SPI_finish();
-
-		exec_on_all_nodes(idx, psprintf("DROP TABLE IF EXISTS %s", idx->remote_table));
-	}
-
+	/* cached plans of the table carry the dropped GSIs */
+	CacheInvalidateRelcache(rel);
 	table_close(rel, NoLock);
 	PG_RETURN_VOID();
 }

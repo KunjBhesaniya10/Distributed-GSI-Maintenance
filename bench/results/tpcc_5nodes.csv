@@ -1,0 +1,4 @@
+config,tps,avg_ms,p50_ms,p95_ms,p99_ms,retries,errors
+broadcast (no GSI),262.8,30.456,29.753,37.458,50.758,0,0
+sync GSI,1650.5,4.843,5.205,7.482,10.212,1,0
+async GSI,1608.4,4.966,5.303,7.826,10.524,0,0

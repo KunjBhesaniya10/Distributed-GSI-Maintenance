@@ -1,7 +1,7 @@
 FROM postgres:16-bookworm
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends build-essential postgresql-server-dev-16 libkrb5-dev \
+    && apt-get install -y --no-install-recommends build-essential postgresql-server-dev-16 libkrb5-dev iproute2 \
     && rm -rf /var/lib/apt/lists/*
 
 COPY src/gsi_fdw /build/gsi_fdw

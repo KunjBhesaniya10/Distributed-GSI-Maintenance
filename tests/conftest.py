@@ -1,11 +1,12 @@
-"""Shared fixtures: connections to the 4 nodes and a fresh GSI per test."""
+"""Shared fixtures: connections to the nodes and a fresh GSI per test."""
+import os
 import time
 
 import psycopg2
 import pytest
 
 COORD = dict(host="localhost", port=5432, user="postgres", dbname="postgres")
-NNODES = 5                                   # data nodes in docker-compose.yml
+NNODES = int(os.environ.get("NNODES", 5))    # data nodes in use (docker compose NNODES)
 SHARDS = [dict(COORD, port=5433 + i) for i in range(NNODES)]
 
 
@@ -45,10 +46,10 @@ def reset_cluster(coord, shards, unique=False):
     for s in shards:
         for (gid,) in q(s, "SELECT gid FROM pg_prepared_xacts WHERE gid LIKE 'gsi\\_%'"):
             q(s, f"ROLLBACK PREPARED '{gid}'")
-        q(s, "TRUNCATE users_shard")
+        q(s, "TRUNCATE users_shard, gsi_outbox")
     if q(coord, "SELECT 1 FROM gsi.gsi_index WHERE base_table = 'users'::regclass"):
         q(coord, "SELECT gsi_drop('users')")
-    q(coord, "SELECT gsi_create('users', 'email', %s)", (unique,))
+    q(coord, "CALL gsi_create('users', 'email', %s)", (unique,))
 
 
 @pytest.fixture

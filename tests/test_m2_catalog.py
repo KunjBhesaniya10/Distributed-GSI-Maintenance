@@ -2,7 +2,7 @@
 import psycopg2
 import pytest
 
-from conftest import NNODES, q
+from conftest import COORD, NNODES, connect, q
 
 
 def test_index_tables_created(gsi, shards):
@@ -24,11 +24,24 @@ def test_placement_spreads_keys(gsi):
     assert all(c > 300 / NNODES / 2 for c in counts), counts
 
 
-def test_create_requires_empty_table(gsi):
+def test_create_on_full_table_backfills(gsi, shards):
+    # online build (phase 2): existing rows get their entries
     q(gsi, "SELECT gsi_drop('users')")
-    q(gsi, "INSERT INTO users VALUES (1, 'a@x', 'a')")
-    with pytest.raises(psycopg2.errors.FeatureNotSupported):
-        q(gsi, "SELECT gsi_create('users', 'email')")
+    q(gsi, "INSERT INTO users VALUES (1, 'a@x', 'a'), (2, 'b@x', 'b')")
+    q(gsi, "CALL gsi_create('users', 'email')")
+    assert q(gsi, "SELECT status FROM gsi.gsi_index") == [("ready",)]
+    assert sorted(r for s in shards for r in q(s, "SELECT key, id FROM gsi_users_email")) == \
+        [("a@x", 1), ("b@x", 2)]
+
+
+def test_create_not_in_transaction_block(gsi):
+    q(gsi, "SELECT gsi_drop('users')")
+    c = connect(COORD, autocommit=False)          # psycopg2 wraps the CALL in BEGIN
+    try:
+        with pytest.raises(psycopg2.errors.ActiveSqlTransaction):
+            q(c, "CALL gsi_create('users', 'email')")
+    finally:
+        c.close()
 
 
 def test_drop_removes_tables(gsi, shards):

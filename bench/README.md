@@ -16,23 +16,33 @@ the real write path (base row + GSI entries, 2PC), with two GSIs:
 The data is generated deterministically in SQL, so every laptop gets the same table. Afterwards
 `python tests/checker.py` verifies both GSIs (about 2 minutes at 1M rows).
 
+`NAMES=sweep bash bench/load_users.sh` loads names for the selectivity sweep instead: every name
+`k<K>_<n>` matches exactly K rows (K = 1, 10, 100, 1000), and `name` gets a large statistics
+target so ANALYZE knows each K. Needed by `experiments.py lookups`.
+
 ## Lookups: GSI vs broadcast
 
-`bash bench/run_lookups.sh [seconds] [clients]` runs pgbench inside the coordinator with
-`lookup_email.sql` (unique key) and `lookup_name.sql` (non-unique key), each with
-`gsi.enable_lookup = on` (GsiLookup) and `off` (Append over every shard). `LOCAL_INDEX=1` first
-creates an index on `email` and `name` on every shard, so broadcast uses index scans: the fair
-baseline.
+`bash bench/run_lookups.sh [seconds] [clients]` runs pgbench (`-M prepared`) inside the coordinator
+with `lookup_email.sql` (unique key) and `lookup_name.sql` (non-unique key), once with each plan
+forced: `gsi.force_lookup = on` (GsiLookup) and `gsi.enable_lookup = off` (Append over every
+shard). `LOCAL_INDEX=1` first creates an index on `email` and `name` on every shard, so broadcast
+uses index scans: the fair baseline.
 
-## Planned (M9, after checkpoint 1)
+## Phase 2 experiments
 
-| Experiment | Measures | Variable |
+What each one measures, the commands, and the results: [docs/phase2_results.md](../docs/phase2_results.md)
+(sections E1-E7). CSVs go to `bench/results/`; `--tag` adds a suffix to the file names (e.g. the
+network delay, which the script can't detect).
+
+| File / command | Experiment | Result files |
 |---|---|---|
-| Lookup latency | p50/p99 latency, tps | nodes 2..5, rows 100k..1M, unique vs non-unique key, with/without shard indexes |
-| Write cost | insert/update tps and latency | no GSI vs 1 vs 2 sync GSIs; clients 1..16 |
-| Selectivity crossover | latency vs matching rows | rows per key 1..10k; input for the cost model |
-| Recovery | time until the checker is clean | crash point (`gsi.fail_point`), resolver interval |
-| Async lag (stretch) | WAL lag, staleness | write rate |
+| `python bench/experiments.py lookups` | E1: GSI speedup vs selectivity, planner choice, planning time | `lookups_<N>nodes[_tag].csv`, `planning_<N>nodes[_tag].csv` |
+| `python bench/experiments.py writes` | E2: write cost, none / sync / async | `writes.csv` |
+| `bash bench/node_sweep.sh` | E3: `lookups` on 2, 3, 5 nodes (fresh cluster each) | `lookups_<N>nodes.csv` |
+| `python bench/experiments.py hot_keys` | E4: hot keys (Zipf) under sync writes | `hot_keys.csv` |
+| `python bench/experiments.py async_lag` | E5: async lag and missed reads | `async_lag.csv` |
+| `python bench/experiments.py build` | E6: online build time and impact on writes | `build.csv` |
+| `python bench/experiments.py tpcc` | E7: TPC-C-derived customer workload | `tpcc_<N>nodes.csv` |
+| `bash bench/net_delay.sh <ms>` | adds a round-trip delay between the containers (0 removes it) | - |
 
-A TPC-C-style `customer` lookup by last name (non-unique, the case TPC-C's Payment and
-Order-Status transactions use) is the planned standard workload next to the synthetic `users` data.
+`bench/results/sequential_hop2/` holds the first round, measured before hop 2 was parallel.

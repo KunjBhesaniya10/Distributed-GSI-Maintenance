@@ -5,9 +5,11 @@
  *
  * A GSI on column c of a hash-partitioned table stores one entry
  * (key, id, shard) per row in table gsi_<index> on node hash(key) mod N.
- * Index writes run on postgres_fdw connections inside the remote
- * transactions, and any transaction that wrote a GSI table commits all
- * remote transactions with two-phase commit (see connection.c).
+ * A sync GSI is written on postgres_fdw connections inside the remote
+ * transactions, and any transaction that wrote one commits all remote
+ * transactions with two-phase commit (see connection.c).  An async GSI
+ * only gets an outbox row on the base node; the applier workers write the
+ * entries later (gsi_async.c).
  *
  *-------------------------------------------------------------------------
  */
@@ -28,7 +30,8 @@ typedef struct GsiIndex
 	Oid			typid;
 	Oid			collid;
 	bool		is_unique;
-	bool		is_ready;
+	bool		is_ready;		/* status 'ready': the planner may use it */
+	bool		is_async;		/* mode 'async': maintained via the outbox */
 	int			nnodes;
 	Oid		   *servers;		/* foreign server of each node id */
 } GsiIndex;
@@ -59,6 +62,7 @@ typedef struct GsiModifyState
 
 /* gsi.c */
 extern int	gsi_remote_lock_timeout;
+extern bool gsi_trace;
 extern void gsi_init(void);
 extern Oid *gsi_load_nodes(int *nnodes, MemoryContext cxt);
 extern List *gsi_indexes_for_rel(Oid relid);
@@ -72,10 +76,31 @@ extern List *gsi_begin_modify(Relation rel, CmdType operation,
 							  Plan *subplan, List *target_attrs);
 extern void gsi_capture_row(List *states, CmdType operation,
 							TupleTableSlot *slot, TupleTableSlot *planSlot);
+extern void gsi_note_base_write(List *states, PGconn *conn);
 extern void gsi_apply_row(List *states);
 extern void gsi_fail_point(const char *name);
+extern void gsi_pause_point(const char *name);
+extern GsiIndex *gsi_index_by_name(const char *name);
+extern GsiIndex *gsi_index_on_column(List *indexes, const char *col);
+extern Datum gsi_key_from_text(GsiIndex *idx, const char *text);
+extern void gsi_exec_on_all_nodes(GsiIndex *idx, const char *sql);
+extern void gsi_drop_index(GsiIndex *idx);
+
+/* NOTICE in the client's session when gsi.trace is on (demo / debugging) */
+#define GSI_TRACE(...) \
+	do { \
+		if (gsi_trace) \
+			ereport(NOTICE, (errmsg_internal(__VA_ARGS__))); \
+	} while (0)
+
+/* gsi_build.c */
+extern void gsi_build_init(void);
+
+/* gsi_async.c */
+extern void gsi_async_init(void);
 
 /* gsi_resolver.c */
+extern char *gsi_resolver_database;	/* also used by the applier workers */
 extern int	gsi_resolve_all(int grace_secs);
 extern void gsi_resolver_init(void);
 
@@ -84,6 +109,7 @@ extern void gsi_scan_init(void);
 
 /* connection.c */
 extern void gsi_mark_conn(PGconn *conn, bool is_index);
+extern void gsi_note_async_write(void);
 extern PGconn *gsi_connect_raw(ForeignServer *server, UserMapping *user);
 extern void gsi_disconnect_raw(PGconn *conn);
 

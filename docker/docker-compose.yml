@@ -1,10 +1,12 @@
 # 1 coordinator + 5 data nodes; each data node holds one base partition
-# and one index partition.
+# and one index partition.  NNODES=2..5 uses only shard1..shardN (the
+# others idle); changing it needs `docker compose down -v`.
 x-node: &node
   image: gsi-pg:16
   build: { context: .., dockerfile: docker/Dockerfile }
   environment:
     POSTGRES_HOST_AUTH_METHOD: trust
+  cap_add: [NET_ADMIN]          # bench/net_delay.sh adds network delay with tc
   healthcheck:
     test: ["CMD", "pg_isready", "-U", "postgres"]
     interval: 2s
@@ -12,7 +14,10 @@ x-node: &node
 
 x-shard: &shard
   <<: *node
-  command: postgres -c max_prepared_transactions=100
+  # syncfs: crash recovery syncs the data directory with one call, not an
+  # fsync per file (minutes on Docker Desktop's disk); crash tests and the
+  # demo restart nodes often
+  command: postgres -c max_prepared_transactions=100 -c recovery_init_sync_method=syncfs
   volumes: ["./init/datanode.sql:/docker-entrypoint-initdb.d/init.sql:ro"]
 
 services:
@@ -41,8 +46,13 @@ services:
       postgres -c shared_preload_libraries=gsi_fdw
                -c max_prepared_transactions=100
                -c synchronous_commit=on
+               -c recovery_init_sync_method=syncfs
+               -c gsi.applier_workers=${NNODES:-5}
+    environment:
+      POSTGRES_HOST_AUTH_METHOD: trust
+      NNODES: ${NNODES:-5}
     ports: ["5432:5432"]
-    volumes: ["./init/coordinator.sql:/docker-entrypoint-initdb.d/init.sql:ro"]
+    volumes: ["./init/coordinator.sh:/docker-entrypoint-initdb.d/init.sh:ro"]
     depends_on:
       shard1: { condition: service_healthy }
       shard2: { condition: service_healthy }
